@@ -453,11 +453,24 @@ USER_ACTIVITY_COLUMNS = [
 
 
 def build_user_activity_rows(org: str, ndjson_records: list[dict]) -> list[dict]:
-    """Flatten NDJSON per-user-per-day records into CSV rows."""
+    """Flatten NDJSON per-user-per-day records into CSV rows.
+
+    The NDJSON schema uses nested objects for breakdowns. Chat mode counts
+    are inside totals_by_feature, CLI data is in totals_by_cli, and IDE
+    info is in totals_by_ide. We extract and flatten them here.
+    """
     rows = []
     for rec in ndjson_records:
+        # Extract chat mode counts from totals_by_feature (nested)
+        by_feature = rec.get("totals_by_feature", {}) or {}
+        chat_modes = _extract_chat_modes(by_feature, rec)
+
+        # CLI data
         cli = rec.get("totals_by_cli", {}) or {}
         cli_tokens = cli.get("token_usage", {}) or {}
+
+        # IDE info from totals_by_ide (nested)
+        ide_version, plugin_version = _extract_ide_info(rec)
 
         rows.append({
             "day": rec.get("day", ""),
@@ -472,11 +485,11 @@ def build_user_activity_rows(org: str, ndjson_records: list[dict]) -> list[dict]
             "used_code_review_passive": rec.get("used_copilot_code_review_passive", ""),
             # Interactions
             "interaction_count": rec.get("user_initiated_interaction_count", ""),
-            "chat_ask_mode": rec.get("chat_panel_ask_mode", ""),
-            "chat_edit_mode": rec.get("chat_panel_edit_mode", ""),
-            "chat_plan_mode": rec.get("chat_panel_plan_mode", ""),
-            "chat_agent_mode": rec.get("chat_panel_agent_mode", ""),
-            "chat_custom_mode": rec.get("chat_panel_custom_mode", ""),
+            "chat_ask_mode": chat_modes.get("ask", ""),
+            "chat_edit_mode": chat_modes.get("edit", ""),
+            "chat_plan_mode": chat_modes.get("plan", ""),
+            "chat_agent_mode": chat_modes.get("agent", ""),
+            "chat_custom_mode": chat_modes.get("custom", ""),
             # Code completions
             "code_gen_count": rec.get("code_generation_activity_count", ""),
             "code_accept_count": rec.get("code_acceptance_activity_count", ""),
@@ -491,10 +504,82 @@ def build_user_activity_rows(org: str, ndjson_records: list[dict]) -> list[dict]
             "cli_prompt_tokens": cli_tokens.get("prompt_tokens_sum", ""),
             "cli_avg_tokens_per_req": cli_tokens.get("avg_tokens_per_request", ""),
             # IDE
-            "ide_version": rec.get("last_known_ide_version", ""),
-            "plugin_version": rec.get("last_known_plugin_version", ""),
+            "ide_version": ide_version,
+            "plugin_version": plugin_version,
         })
     return rows
+
+
+def _extract_chat_modes(by_feature: dict, rec: dict) -> dict:
+    """Extract chat mode interaction counts from nested structures.
+
+    The NDJSON may store chat modes as:
+    - Top-level: chat_panel_ask_mode, chat_panel_edit_mode, etc.
+    - Nested: totals_by_feature with feature names like
+      "chat_panel_ask", "chat_panel_edit", "chat_panel_agent", etc.
+    """
+    modes = {}
+
+    # Try top-level fields first
+    for mode in ("ask", "edit", "plan", "agent", "custom"):
+        key = f"chat_panel_{mode}_mode"
+        val = rec.get(key)
+        if val is not None and val != "":
+            modes[mode] = val
+
+    # If top-level fields are empty, try totals_by_feature
+    if not modes and by_feature:
+        if isinstance(by_feature, dict):
+            for feature_key, feature_data in by_feature.items():
+                for mode in ("ask", "edit", "plan", "agent", "custom"):
+                    if mode in feature_key.lower():
+                        count = feature_data if isinstance(feature_data, (int, float)) else 0
+                        if isinstance(feature_data, dict):
+                            count = (feature_data.get("user_initiated_interaction_count", 0)
+                                     or feature_data.get("count", 0) or 0)
+                        if count:
+                            modes[mode] = count
+        elif isinstance(by_feature, list):
+            for item in by_feature:
+                if not isinstance(item, dict):
+                    continue
+                name = (item.get("name", "") or item.get("feature", "") or "").lower()
+                count = (item.get("user_initiated_interaction_count", 0)
+                         or item.get("count", 0) or 0)
+                for mode in ("ask", "edit", "plan", "agent", "custom"):
+                    if mode in name and count:
+                        modes[mode] = count
+
+    # Also compute from the interaction_count if we know used_agent
+    if not modes and rec.get("used_agent") and rec.get("user_initiated_interaction_count"):
+        # Can't split by mode, but at least attribute to agent
+        modes["agent"] = rec.get("user_initiated_interaction_count", 0)
+
+    return modes
+
+
+def _extract_ide_info(rec: dict) -> tuple[str, str]:
+    """Extract IDE and plugin version from nested totals_by_ide or top-level fields."""
+    # Try top-level first
+    ide = rec.get("last_known_ide_version", "")
+    plugin = rec.get("last_known_plugin_version", "")
+    if ide or plugin:
+        return ide, plugin
+
+    # Try totals_by_ide
+    by_ide = rec.get("totals_by_ide", {}) or {}
+    if isinstance(by_ide, dict) and by_ide:
+        # Take the first IDE entry
+        for ide_name, ide_data in by_ide.items():
+            if isinstance(ide_data, dict):
+                return ide_name, ide_data.get("plugin_version", "")
+            return ide_name, ""
+    elif isinstance(by_ide, list) and by_ide:
+        first = by_ide[0]
+        if isinstance(first, dict):
+            return first.get("name", ""), first.get("plugin_version", "")
+
+    return "", ""
 # ---------------------------------------------------------------------------
 
 USER_CSV_COLUMNS = [
@@ -658,11 +743,11 @@ def build_org_summary(org: str, seats: list[dict], daily_records: list[dict],
     start = (now - timedelta(days=days)).strftime("%Y-%m-%d")
     end = now.strftime("%Y-%m-%d")
 
-    # Aggregate daily metrics
+    # Aggregate daily metrics (from legacy API)
     active_user_vals = [d.get("total_active_users", 0) or 0 for d in daily_records]
     avg_active = round(sum(active_user_vals) / len(active_user_vals), 1) if active_user_vals else 0
 
-    # Suggestions & lines from copilot_ide_code_completions
+    # Suggestions & lines from copilot_ide_code_completions (legacy)
     total_suggestions = 0
     total_accepted = 0
     total_lines_suggested = 0
@@ -674,9 +759,7 @@ def build_org_summary(org: str, seats: list[dict], daily_records: list[dict],
         total_lines_suggested += comp.get("total_code_lines_suggested", 0) or 0
         total_lines_accepted += comp.get("total_code_lines_accepted", 0) or 0
 
-    acceptance_rate = round(total_accepted / total_suggestions * 100, 1) if total_suggestions else 0
-
-    # Chat turns
+    # Chat turns (legacy)
     total_chat = 0
     for day in daily_records:
         ide_chat = day.get("copilot_ide_chat", {}) or {}
@@ -684,10 +767,60 @@ def build_org_summary(org: str, seats: list[dict], daily_records: list[dict],
         dotcom_chat = day.get("copilot_dotcom_chat", {}) or {}
         total_chat += dotcom_chat.get("total_chats", 0) or 0
 
-    # Top languages & editors
+    # Top languages & editors (legacy)
     lang_counts = _extract_language_counts(daily_records)
-    top_langs = ", ".join(l for l, _ in lang_counts.most_common(5)) if lang_counts else ""
     editor_counts = _extract_editor_counts(daily_records)
+
+    # If legacy metrics are empty but we have NDJSON, compute from NDJSON
+    if ndjson_records and total_suggestions == 0:
+        unique_active = set()
+        for rec in ndjson_records:
+            login = rec.get("user_login", "")
+            if rec.get("used_chat") or rec.get("used_agent"):
+                unique_active.add(login)
+            total_suggestions += (rec.get("code_generation_activity_count", 0) or 0)
+            total_accepted += (rec.get("code_acceptance_activity_count", 0) or 0)
+            total_lines_suggested += (rec.get("loc_suggested_to_add_sum", 0) or 0)
+            total_lines_accepted += (rec.get("loc_added_sum", 0) or 0)
+            total_chat += (rec.get("user_initiated_interaction_count", 0) or 0)
+
+            # Extract languages from totals_by_language_feature
+            by_lang = rec.get("totals_by_language_feature") or rec.get("totals_by_language_model")
+            if isinstance(by_lang, dict):
+                for lang_name, lang_data in by_lang.items():
+                    count = lang_data if isinstance(lang_data, (int, float)) else 0
+                    if isinstance(lang_data, dict):
+                        count = (lang_data.get("code_generation_activity_count", 0)
+                                 or lang_data.get("loc_added_sum", 0) or 0)
+                    if count:
+                        lang_counts[lang_name] += int(count)
+            elif isinstance(by_lang, list):
+                for item in by_lang:
+                    if isinstance(item, dict):
+                        name = item.get("name", "") or item.get("language", "")
+                        count = (item.get("code_generation_activity_count", 0)
+                                 or item.get("loc_added_sum", 0) or 0)
+                        if name and count:
+                            lang_counts[name] += int(count)
+
+            # Extract editors from totals_by_ide
+            by_ide = rec.get("totals_by_ide")
+            if isinstance(by_ide, dict):
+                for ide_name, ide_data in by_ide.items():
+                    count = 1  # count user-days per IDE
+                    editor_counts[ide_name] += count
+            elif isinstance(by_ide, list):
+                for item in by_ide:
+                    if isinstance(item, dict):
+                        name = item.get("name", "")
+                        if name:
+                            editor_counts[name] += 1
+
+        if not avg_active and unique_active:
+            avg_active = len(unique_active)
+
+    acceptance_rate = round(total_accepted / total_suggestions * 100, 1) if total_suggestions else 0
+    top_langs = ", ".join(l for l, _ in lang_counts.most_common(5)) if lang_counts else ""
     top_editors = ", ".join(e for e, _ in editor_counts.most_common(3)) if editor_counts else ""
 
     # New metrics from NDJSON per-user data
@@ -887,6 +1020,11 @@ def main() -> None:
         print(f"  Fetching per-user NDJSON metrics …")
         ndjson = fetch_user_metrics_ndjson(token, org)
         print(f"  Received {len(ndjson)} per-user-day records.")
+
+        # Show actual NDJSON field names (first record) for diagnostics
+        if ndjson and args.raw_json:
+            rec = ndjson[0]
+            print(f"  📋 NDJSON fields ({len(rec)} keys): {', '.join(sorted(rec.keys()))}")
 
         # Build rows
         user_rows = build_user_rows(org, seats)

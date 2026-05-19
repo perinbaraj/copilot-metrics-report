@@ -1,0 +1,23 @@
+# Generated CSV reports
+copilot_users_*.csv
+copilot_user_activity_*.csv
+copilot_org_summary_*.csv
+copilot_raw_*.json
+
+# Environment files with secrets
+.env
+.env.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

@@ -113,13 +113,17 @@ function Write-ApiError {
 function Test-Token {
     param([string]$TokenValue)
     $headers = Get-AuthHeaders -TokenValue $TokenValue
-    $resp = Invoke-GitHubApi -Url "$script:GitHubApiBase/user" -Headers $headers
-    if ($resp.StatusCode -ne 200) {
-        Write-Error "Token invalid (HTTP $($resp.StatusCode))."
+    try {
+        $resp = Invoke-WebRequest -Uri "$script:GitHubApiBase/user" -Headers $headers -UseBasicParsing -TimeoutSec 30
+    } catch {
+        $sc = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+        Write-Error "Token invalid (HTTP $sc)."
         exit 1
     }
-    $login = $resp.Content.login
-    Write-Host "`n`u{1F511} Authenticated as: $login" -ForegroundColor Green
+    $login = ($resp.Content | ConvertFrom-Json).login
+    $scopes = $resp.Headers['X-OAuth-Scopes']
+    if (-not $scopes) { $scopes = '(unknown)' }
+    Write-Host "`n`u{1F511} Authenticated as: $login  |  Scopes: $scopes" -ForegroundColor Green
 }
 
 # ---------------------------------------------------------------------------
@@ -535,7 +539,14 @@ if (Test-Path $envFile) {
     Get-Content $envFile | ForEach-Object {
         $line = $_.Trim()
         if ($line -and -not $line.StartsWith("#") -and $line -match "^([^=]+)=(.*)$") {
-            [System.Environment]::SetEnvironmentVariable($Matches[1].Trim(), $Matches[2].Trim(), "Process")
+            $key = $Matches[1].Trim()
+            $value = $Matches[2].Trim()
+            # Strip surrounding single or double quotes (matches python-dotenv behavior)
+            if (($value.StartsWith('"') -and $value.EndsWith('"')) -or
+                ($value.StartsWith("'") -and $value.EndsWith("'"))) {
+                $value = $value.Substring(1, $value.Length - 2)
+            }
+            [System.Environment]::SetEnvironmentVariable($key, $value, "Process")
         }
     }
     # Re-read params from env if not provided via args
@@ -579,14 +590,17 @@ $csvPath = Join-Path $OutputDir "copilot_report_$today.csv"
 Write-Host "Output directory: $OutputDir"
 Write-Host "Target CSV: $csvPath"
 
-# Remove stale CSV from earlier runs so customer can't be confused by leftover file
+# Remove stale CSV from earlier runs so customer can't be confused by leftover file.
+# If the file is locked (e.g., open in Excel), fall back to a timestamped filename
+# instead of forcing the user to close it — matches Python's PermissionError handling.
 if (Test-Path $csvPath) {
     try {
         Remove-Item $csvPath -Force -ErrorAction Stop
         Write-Host "  (removed stale CSV from previous run)" -ForegroundColor DarkGray
     } catch {
-        Write-Host "  `u{26A0} Could not remove stale CSV ($($_.Exception.Message)). Close it in Excel and retry." -ForegroundColor Yellow
-        exit 1
+        $ts = (Get-Date).ToString("HHmmss")
+        $csvPath = Join-Path $OutputDir "copilot_report_${today}_${ts}.csv"
+        Write-Host "  `u{26A0} Existing CSV is locked (Excel?). Writing to $csvPath instead." -ForegroundColor Yellow
     }
 }
 
@@ -684,7 +698,7 @@ Write-Host "  `u{2705} $userCount users + $summaryCount org summaries `u{2192} $
 # Raw JSON
 if ($RawJson -and $rawData.Count -gt 0) {
     $jsonPath = Join-Path $OutputDir "copilot_raw_$today.json"
-    $rawData | ConvertTo-Json -Depth 10 | Set-Content -Path $jsonPath -Encoding UTF8
+    $rawData | ConvertTo-Json -Depth 20 | Set-Content -Path $jsonPath -Encoding UTF8
     Write-Host "  `u{2705} Raw JSON `u{2192} $jsonPath"
 }
 

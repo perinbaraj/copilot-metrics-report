@@ -1,98 +1,134 @@
 # Copilot Metrics Report Generator
 
-A standalone Python CLI tool that pulls GitHub Copilot usage data via the
-REST API and generates management-ready CSV reports.
+Pull GitHub Copilot usage data via the REST API and generate management-ready
+CSV reports at user and organization levels. Available in **Python** and **PowerShell**.
 
-## What It Produces
+## Scripts
 
-| File | Description |
-|------|-------------|
-| `copilot_users_YYYYMMDD.csv` | One row per user per org — seat status, last activity, editor |
-| `copilot_user_activity_YYYYMMDD.csv` | **NEW** — One row per user per day — chat modes, agent, CLI tokens, code completions, code review |
-| `copilot_org_summary_YYYYMMDD.csv` | One row per org — adoption rate, suggestions, acceptance rate, agent/CLI/code review stats |
+| Script | Language | Description |
+|--------|----------|-------------|
+| `copilot_customer_report.py` | Python | **Customer-ready** single CSV — 19 columns, zero empty, org summaries |
+| `copilot_customer_report.ps1` | PowerShell | Same output as above — no external dependencies |
+| `copilot_metrics_report.py` | Python | Detailed multi-CSV report (3 files) — full NDJSON metrics |
 
-## Prerequisites
+## Quick Start
 
-1. **Python 3.10+**
-2. **GitHub Personal Access Token (classic)** with these scopes:
-   - `manage_billing:copilot` — read seat/billing data
-   - `read:org` — read org membership
-   - `read:enterprise` — list orgs under an enterprise (only needed with `--enterprise`)
-3. Copilot must be enabled for the target organizations.
-
-## Setup
+### Python
 
 ```bash
 cd copilot-metrics-report
 pip install -r requirements.txt
+cp .env.example .env   # edit with your token
 
-# Copy and edit the env file
-cp .env.example .env
-# Edit .env with your token and org list
+# Customer report (recommended)
+python copilot_customer_report.py --enterprise my-enterprise
+python copilot_customer_report.py --orgs org1,org2 --token ghp_xxx
 ```
 
-## Usage
+### PowerShell
 
-```bash
-# Auto-discover all orgs under an enterprise (easiest)
-python copilot_metrics_report.py --enterprise my-enterprise
+```powershell
+# No dependencies needed
+.\copilot_customer_report.ps1 -Enterprise my-enterprise -Token ghp_xxx
+.\copilot_customer_report.ps1 -Orgs "org1,org2"
+```
 
-# Specific orgs only
-python copilot_metrics_report.py --orgs my-org
+## Prerequisites
 
-# Multiple orgs
-python copilot_metrics_report.py --orgs org1,org2,org3
+1. **Python 3.10+** (for `.py` scripts) or **PowerShell 5.1+** (for `.ps1`)
+2. **GitHub Personal Access Token (classic)** with scopes:
+   - `manage_billing:copilot` — read seat/billing data
+   - `read:org` — read org membership
+   - `admin:enterprise` — list orgs under an enterprise (for `--enterprise`)
+3. Copilot must be enabled for the target organizations.
+4. For SAML-protected orgs, authorize your PAT for SSO at https://github.com/settings/tokens
 
-# Custom date range (last 14 days)
-python copilot_metrics_report.py --enterprise my-ent --days 14
+## Customer Report Output
 
-# Specify token inline + output directory
-python copilot_metrics_report.py --token ghp_xxx --enterprise my-ent --output-dir ./reports
+**`copilot_report_YYYYMMDD.csv`** — single CSV, one row per user, grouped by org.
 
-# Also save raw API JSON responses
-python copilot_metrics_report.py --enterprise my-ent --raw-json
+### Columns (19 — all guaranteed populated)
+
+| Column | Description |
+|--------|-------------|
+| `organization` | Org the user belongs to |
+| `user_login` | GitHub username |
+| `status` | `active` / `inactive` |
+| `plan_type` | `business` / `enterprise` |
+| `seat_assigned_date` | When Copilot seat was assigned |
+| `last_activity_date` | Last Copilot usage date |
+| `days_inactive` | Days since last activity (`never` if no activity) |
+| `editor` | Last editor used (e.g. `vscode`, `JetBrains-IU`) |
+| `copilot_model` | Copilot plugin version (e.g. `copilot-chat/0.28.5`) |
+| `total_days_active` | Days with Copilot usage (out of 28) |
+| `utilization_pct` | Active days / 28 × 100 |
+| `total_interactions` | Total prompts sent to Copilot |
+| `total_code_generations` | Code generation events |
+| `total_code_acceptances` | Accepted code suggestions |
+| `acceptance_rate_pct` | Acceptances / generations × 100 |
+| `total_loc_suggested` | Lines of code suggested |
+| `total_loc_added` | Lines actually added to code |
+| `total_loc_deleted` | Lines deleted from code |
+| `features_used` | Features used: `chat`, `agent`, `cli`, `code_review` |
+
+### Org Summary Rows
+
+Between each org's users, a summary row is inserted with:
+- Total/active/inactive seat counts
+- Average utilization %
+- Org-wide acceptance rate
+- Top 3 editors
+- List of inactive users
+
+### Sample Output
+
+```
+organization,user_login,status,plan_type,seat_assigned_date,last_activity_date,days_inactive,editor,copilot_model,total_days_active,utilization_pct,total_interactions,total_code_generations,total_code_acceptances,acceptance_rate_pct,total_loc_suggested,total_loc_added,total_loc_deleted,features_used
+my-org,alice,active,business,2025-01-15,2026-05-20,1,vscode,copilot-chat/0.28.5,18,64.3,245,120,45,37.5,3200,1800,200,"chat, agent"
+my-org,bob,inactive,business,2025-02-01,N/A,never,N/A,N/A,0,0.0,0,0,0,0,0,0,0,none
+── my-org SUMMARY ──,50 seats,42 active / 8 inactive,,,,,"Top: vscode, JetBrains-IU",,,"avg 48.2%",12500,6200,2100,33.9,,8500,1200,"Inactive: bob, charlie"
 ```
 
 ## CLI Options
+
+### Customer Report (Python)
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
 | `--token` | `GITHUB_TOKEN` | — | GitHub PAT |
 | `--enterprise` | `ENTERPRISE_SLUG` | — | Enterprise slug (auto-discovers all orgs) |
 | `--orgs` | `ORGS` | — | Comma-separated org slugs (overrides `--enterprise`) |
+| `--output-dir` | `OUTPUT_DIR` | `.` | Directory for CSV output |
+| `--raw-json` | — | off | Also save raw API JSON responses |
+
+### Customer Report (PowerShell)
+
+| Parameter | Env Var | Default | Description |
+|-----------|---------|---------|-------------|
+| `-Token` | `GITHUB_TOKEN` | — | GitHub PAT |
+| `-Enterprise` | `ENTERPRISE_SLUG` | — | Enterprise slug |
+| `-Orgs` | `ORGS` | — | Comma-separated org slugs |
+| `-OutputDir` | `OUTPUT_DIR` | `.` | Output directory |
+| `-RawJson` | — | off | Also save raw API JSON |
+
+### Detailed Report (Python — `copilot_metrics_report.py`)
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--token` | `GITHUB_TOKEN` | — | GitHub PAT |
+| `--enterprise` | `ENTERPRISE_SLUG` | — | Enterprise slug |
+| `--orgs` | `ORGS` | — | Comma-separated org slugs |
 | `--days` | `DAYS` | `28` | Metrics window in days |
 | `--output-dir` | `OUTPUT_DIR` | `.` | Directory for CSV output |
 | `--raw-json` | — | off | Also dump raw API JSON |
-
-## Sample Output
-
-### `copilot_users_20260519.csv`
-
-```
-organization,login,name,email,seat_created_at,copilot_assigned_at,last_activity_at,last_activity_editor,status,days_since_last_activity,plan_type
-my-org,octocat,The Octocat,octocat@github.com,2025-01-15T10:00:00Z,,2026-05-18T14:30:00Z,vscode,active,1,business
-my-org,hubot,Hubot,,2025-02-01T08:00:00Z,,,,,inactive,,business
-```
-
-### `copilot_user_activity_20260519.csv` (NEW — per-user per-day detail)
-
-```
-day,organization,user_login,user_id,used_chat,used_agent,used_cli,used_code_review_active,used_code_review_passive,interaction_count,chat_ask_mode,chat_edit_mode,chat_plan_mode,chat_agent_mode,chat_custom_mode,code_gen_count,code_accept_count,loc_suggested_add,loc_added,loc_deleted,cli_sessions,cli_requests,cli_prompts,cli_output_tokens,cli_prompt_tokens,cli_avg_tokens_per_req,ide_version,plugin_version
-2026-05-18,my-org,octocat,12345,True,True,True,True,False,45,10,8,5,20,2,30,22,500,350,50,3,15,12,8000,3000,733,vscode/1.90,1.200.0
-```
-
-### `copilot_org_summary_20260519.csv`
-
-```
-organization,total_seats,active_seats,inactive_seats,adoption_rate_pct,date_range_start,date_range_end,avg_daily_active_users,total_suggestions_shown,total_suggestions_accepted,acceptance_rate_pct,total_lines_suggested,total_lines_accepted,total_chat_turns,total_agent_users,total_cli_users,total_code_review_users,total_cli_tokens,agent_adoption_pct,top_languages,top_editors
-my-org,50,42,8,84.0,2026-04-21,2026-05-19,35.2,125000,37500,30.0,250000,75000,8500,15,8,12,450000,35.7,"python, javascript, typescript, go, java","vscode, jetbrains, neovim"
-```
 
 ## Troubleshooting
 
 | Error | Fix |
 |-------|-----|
 | `401 Authentication failed` | Check your PAT is valid and not expired |
-| `403 Forbidden` | Ensure PAT has `manage_billing:copilot` and `read:org` scopes |
-| `404 Not found` | Verify the org slug is correct and Copilot is enabled |
+| `403 Forbidden` | Ensure PAT has required scopes; for SAML orgs, authorize SSO |
+| `404 Not found` | Verify the org/enterprise slug is correct and Copilot is enabled |
+| `SAML enforcement` | Authorize PAT for SSO at https://github.com/settings/tokens |
 | Rate-limited | The script auto-waits; for large orgs, run during off-peak hours |
+| File locked (PermissionError) | Close the CSV in Excel before re-running |

@@ -37,7 +37,7 @@ param(
 )
 
 Set-StrictMode -Off
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -420,11 +420,55 @@ function Build-OrgReport {
         })
     }
 
-    # Sort: active first, then inactive
+    # Add users from NDJSON who don't have seat records (e.g. when seats API returns 403)
+    $seatLogins = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($r in $userRows) { [void]$seatLogins.Add($r.user_login) }
+
+    foreach ($ndjsonLogin in $userAgg.Keys) {
+        if ($seatLogins.Contains($ndjsonLogin)) { continue }
+        $u = $userAgg[$ndjsonLogin]
+        $daysActive = $u.days_active
+        $utilization = [math]::Round($daysActive / $script:ReportDays * 100, 1)
+        [void]$utilizations.Add($utilization)
+
+        $codeGen = $u.code_gen
+        $codeAccept = $u.code_accept
+        $acceptRate = if ($codeGen -gt 0) { [math]::Round($codeAccept / $codeGen * 100, 1) } else { 0 }
+
+        $totalInteractions += $u.interactions
+        $totalCodeGen += $codeGen
+        $totalCodeAccept += $codeAccept
+        $totalLocAdded += $u.loc_added
+        $totalLocDeleted += $u.loc_deleted
+
+        $features = Get-FeaturesUsed -U $u
+
+        [void]$userRows.Add([PSCustomObject]@{
+            organization         = $Org
+            user_login           = $ndjsonLogin
+            status               = "active"
+            plan_type            = "N/A"
+            seat_assigned_date   = "N/A"
+            last_activity_date   = "N/A"
+            days_inactive        = 0
+            editor               = "N/A"
+            copilot_model        = "N/A"
+            total_days_active    = $daysActive
+            utilization_pct      = $utilization
+            total_interactions   = $u.interactions
+            total_code_generations  = $codeGen
+            total_code_acceptances  = $codeAccept
+            acceptance_rate_pct  = $acceptRate
+            total_loc_suggested  = $u.loc_suggested
+            total_loc_added      = $u.loc_added
+            total_loc_deleted    = $u.loc_deleted
+            features_used        = $features
+        })
+    }
     $sorted = @($userRows | Sort-Object @{Expression = { if ($_.status -eq "active") { 0 } else { 1 } }}, user_login)
 
     # Org summary row
-    $totalSeats = $Seats.Count
+    $totalSeats = [math]::Max($Seats.Count, $userRows.Count)
     $activeCount = $totalSeats - $inactiveLogins.Count
     $avgUtil = if ($utilizations.Count -gt 0) { [math]::Round(($utilizations | Measure-Object -Average).Average, 1) } else { 0 }
     $orgAcceptRate = if ($totalCodeGen -gt 0) { [math]::Round($totalCodeAccept / $totalCodeGen * 100, 1) } else { 0 }

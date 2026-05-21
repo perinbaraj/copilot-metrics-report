@@ -45,6 +45,7 @@ REPORT_COLUMNS = [
     "user_login",
     "status",
     "plan_type",
+    "seat_assigned_date",
     "last_activity_date",
     "days_inactive",
     "editor",
@@ -304,6 +305,15 @@ def build_report_rows(org: str, seats: list[dict], ndjson: list[dict]) -> list[d
             except (ValueError, TypeError):
                 pass
 
+        # Seat assigned date
+        seat_created = seat.get("created_at", "")
+        seat_date = "N/A"
+        if seat_created:
+            try:
+                seat_date = datetime.fromisoformat(seat_created.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                pass
+
         status = "active" if last_activity else "inactive"
         if status == "inactive":
             inactive_logins.append(login)
@@ -337,6 +347,7 @@ def build_report_rows(org: str, seats: list[dict], ndjson: list[dict]) -> list[d
             "user_login": login,
             "status": status,
             "plan_type": seat.get("plan_type", "N/A"),
+            "seat_assigned_date": seat_date,
             "last_activity_date": last_date,
             "days_inactive": days_inactive if days_inactive != "" else "never",
             "editor": editor_name,
@@ -371,6 +382,7 @@ def build_report_rows(org: str, seats: list[dict], ndjson: list[dict]) -> list[d
         "user_login": f"{total_seats} seats",
         "status": f"{active_count} active / {len(inactive_logins)} inactive",
         "plan_type": "",
+        "seat_assigned_date": "",
         "last_activity_date": "",
         "days_inactive": "",
         "editor": f"Top: {top_editors}" if top_editors else "N/A",

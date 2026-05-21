@@ -572,12 +572,23 @@ else {
 }
 
 # Prepare output
-$OutputDir = (Resolve-Path $OutputDir -ErrorAction SilentlyContinue).Path
-if (-not $OutputDir) { $OutputDir = $PWD.Path }
 if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
+$OutputDir = (Resolve-Path $OutputDir).Path
 $today = (Get-Date).ToString("yyyyMMdd")
 $csvPath = Join-Path $OutputDir "copilot_report_$today.csv"
 Write-Host "Output directory: $OutputDir"
+Write-Host "Target CSV: $csvPath"
+
+# Remove stale CSV from earlier runs so customer can't be confused by leftover file
+if (Test-Path $csvPath) {
+    try {
+        Remove-Item $csvPath -Force -ErrorAction Stop
+        Write-Host "  (removed stale CSV from previous run)" -ForegroundColor DarkGray
+    } catch {
+        Write-Host "  `u{26A0} Could not remove stale CSV ($($_.Exception.Message)). Close it in Excel and retry." -ForegroundColor Yellow
+        exit 1
+    }
+}
 
 $allRows = [System.Collections.ArrayList]::new()
 $rawData = @{}
@@ -599,7 +610,9 @@ foreach ($org in $orgList) {
     }
 
     $rows = @(Build-OrgReport -Org $org -Seats $seats -NdjsonRecords $ndjson)
-    Write-Host "   Rows generated: $($rows.Count)"
+    $userRowCount = @($rows | Where-Object { $_.organization -and -not $_.organization.StartsWith('--') }).Count
+    $summaryRowCount = $rows.Count - $userRowCount
+    Write-Host "   Rows generated: $($rows.Count) ($userRowCount user(s) + $summaryRowCount summary)"
     foreach ($r in $rows) { [void]$allRows.Add($r) }
 
     if ($RawJson) {
@@ -610,15 +623,22 @@ foreach ($org in $orgList) {
 # Write CSV
 Write-Host "`n`u{1F4DD} Writing report ... ($($allRows.Count) total rows)"
 if ($allRows.Count -eq 0) {
-    Write-Host "  `u{26A0} No data to write. Check API access." -ForegroundColor Yellow
+    Write-Host "  `u{26A0} No data to write. Check API access (likely 403 on seats + 0 NDJSON records)." -ForegroundColor Yellow
 } else {
+    # Preview first user row so customer can see data IS being collected
+    $firstUserRow = $allRows | Where-Object { $_.organization -and -not $_.organization.StartsWith('--') } | Select-Object -First 1
+    if ($firstUserRow) {
+        Write-Host "  Sample row: org=$($firstUserRow.organization), user=$($firstUserRow.user_login), status=$($firstUserRow.status), days_active=$($firstUserRow.total_days_active)" -ForegroundColor DarkGray
+    } else {
+        Write-Host "  `u{26A0} No user rows present - only org summary rows. Seats API likely returned 403 (SAML?) and NDJSON had no user_login data." -ForegroundColor Yellow
+    }
+
     try {
         $allRows | Select-Object $script:ReportColumns | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
         Write-Host "  Export-Csv completed."
     }
     catch {
         Write-Host "  `u{26A0} Export-Csv failed: $($_.Exception.Message)" -ForegroundColor Yellow
-        # Fallback: write manually
         Write-Host "  Trying manual CSV write..."
         try {
             $header = $script:ReportColumns -join ","
@@ -641,6 +661,20 @@ if ($allRows.Count -eq 0) {
             Write-Host "  `u{26A0} Manual write also failed: $($_.Exception.Message)" -ForegroundColor Red
         }
     }
+}
+
+# Verify the file was actually written
+if (Test-Path $csvPath) {
+    $fileInfo = Get-Item $csvPath
+    $lineCount = (Get-Content $csvPath | Measure-Object -Line).Lines
+    Write-Host "  `u{1F4C4} File on disk: $($fileInfo.Length) bytes, $lineCount line(s) (1 header + $($lineCount - 1) data)"
+    if ($lineCount -le 1 -and $allRows.Count -gt 0) {
+        Write-Host "  `u{26A0} CSV has headers but no data despite $($allRows.Count) rows in memory!" -ForegroundColor Red
+        Write-Host "  First row dump for debugging:" -ForegroundColor Yellow
+        $allRows[0] | Format-List | Out-String | Write-Host
+    }
+} else {
+    Write-Host "  `u{26A0} CSV not created at $csvPath" -ForegroundColor Red
 }
 
 $userCount = @($allRows | Where-Object { -not $_.organization.StartsWith("--") }).Count

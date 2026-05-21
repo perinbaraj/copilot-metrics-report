@@ -80,15 +80,20 @@ function Invoke-GitHubApi {
     }
     catch {
         $statusCode = 0
-        if ($_.Exception.Response) {
-            $statusCode = [int]$_.Exception.Response.StatusCode
-        }
         $body = $null
         try {
-            $reader = [System.IO.StreamReader]::new($_.Exception.Response.GetResponseStream())
-            $body = $reader.ReadToEnd() | ConvertFrom-Json
-            $reader.Close()
+            if ($_.Exception.Response) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+                $stream = $_.Exception.Response.GetResponseStream()
+                if ($stream -and $stream.CanRead) {
+                    $reader = [System.IO.StreamReader]::new($stream)
+                    $bodyText = $reader.ReadToEnd()
+                    $reader.Close()
+                    if ($bodyText) { $body = $bodyText | ConvertFrom-Json }
+                }
+            }
         } catch {}
+        if ($statusCode -eq 0) { $statusCode = 999 }
         return @{ StatusCode = $statusCode; Content = $body; Error = $_.Exception.Message }
     }
 }
@@ -124,7 +129,7 @@ function Test-Token {
 function Get-Organizations {
     param([string]$TokenValue, [string]$EntSlug)
     $headers = Get-AuthHeaders -TokenValue $TokenValue
-    $orgList = @()
+    $orgList = [System.Collections.ArrayList]::new()
 
     # Try enterprise endpoint
     $resp = Invoke-GitHubApi -Url "$script:GitHubApiBase/enterprises/$EntSlug/organizations?per_page=100" -Headers $headers
@@ -140,7 +145,7 @@ function Get-Organizations {
         if ($resp.StatusCode -ne 200) { Write-ApiError $resp; break }
         $data = $resp.Content
         if (-not $data -or $data.Count -eq 0) { break }
-        $orgList += @($data | ForEach-Object { $_.login } | Where-Object { $_ })
+        foreach ($o in $data) { if ($o.login) { [void]$orgList.Add($o.login) } }
         if ($data.Count -lt 100) { break }
         $page++
     }
@@ -154,7 +159,7 @@ function Get-Organizations {
 function Get-OrgSeats {
     param([string]$TokenValue, [string]$Org)
     $headers = Get-AuthHeaders -TokenValue $TokenValue
-    $allSeats = @()
+    $allSeats = [System.Collections.ArrayList]::new()
     $page = 1
 
     while ($true) {
@@ -163,14 +168,14 @@ function Get-OrgSeats {
             if ($resp.StatusCode -in @(403, 404)) { Write-ApiError $resp }
             break
         }
-        $pageSeats = $resp.Content.seats
+        $pageSeats = Get-SafeProperty $resp.Content 'seats'
         if (-not $pageSeats -or $pageSeats.Count -eq 0) { break }
-        $allSeats += @($pageSeats)
-        $totalSeats = if ($resp.Content.total_seats) { $resp.Content.total_seats } else { $allSeats.Count }
+        foreach ($s in $pageSeats) { [void]$allSeats.Add($s) }
+        $totalSeats = Get-SafeProperty $resp.Content 'total_seats' $allSeats.Count
         if ($allSeats.Count -ge $totalSeats) { break }
         $page++
     }
-    return $allSeats
+    return @($allSeats)
 }
 
 # ---------------------------------------------------------------------------
@@ -180,39 +185,41 @@ function Get-OrgSeats {
 function Get-NdjsonMetrics {
     param([string]$TokenValue, [string]$Org)
     $headers = Get-AuthHeaders -TokenValue $TokenValue
-    $records = @()
+    $records = [System.Collections.ArrayList]::new()
 
     $resp = Invoke-GitHubApi -Url "$script:GitHubApiBase/orgs/$Org/copilot/metrics/reports/users-28-day/latest" -Headers $headers -TimeoutSec 60
-    if ($resp.StatusCode -ne 200) { return $records }
+    if ($resp.StatusCode -ne 200) { return @($records) }
 
-    $links = $resp.Content.download_links
-    if (-not $links -or $links.Count -eq 0) { return $records }
+    $links = Get-SafeProperty $resp.Content 'download_links'
+    if (-not $links -or $links.Count -eq 0) { return @($records) }
+
+    Write-Host "   Downloading NDJSON ($($links.Count) file(s)) ..." -NoNewline
 
     foreach ($link in $links) {
-        # Download without auth first (pre-signed URL)
+        $dlResp = $null
         try {
             $dlResp = Invoke-WebRequest -Uri $link -TimeoutSec 120 -UseBasicParsing
         }
         catch {
-            # Retry with auth
             try {
                 $dlResp = Invoke-WebRequest -Uri $link -Headers $headers -TimeoutSec 120 -UseBasicParsing
             }
             catch {
-                Write-Host "  `u{26A0} Failed to download NDJSON file." -ForegroundColor Yellow
+                Write-Host " failed." -ForegroundColor Yellow
                 continue
             }
         }
 
-        $lines = $dlResp.Content -split "`n"
-        foreach ($line in $lines) {
-            $line = $line.Trim()
-            if ($line) {
-                try { $records += ($line | ConvertFrom-Json) } catch {}
+        $rawLines = $dlResp.Content -split "`n"
+        foreach ($rawLine in $rawLines) {
+            $rawLine = $rawLine.Trim()
+            if ($rawLine) {
+                try { [void]$records.Add(($rawLine | ConvertFrom-Json)) } catch {}
             }
         }
     }
-    return $records
+    Write-Host " done."
+    return @($records)
 }
 
 # ---------------------------------------------------------------------------

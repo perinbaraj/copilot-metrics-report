@@ -36,7 +36,7 @@ param(
     [switch]$RawJson
 )
 
-Set-StrictMode -Version Latest
+Set-StrictMode -Off
 $ErrorActionPreference = "Stop"
 
 # ---------------------------------------------------------------------------
@@ -95,8 +95,9 @@ function Invoke-GitHubApi {
 
 function Write-ApiError {
     param($Response)
-    if ($Response.Content -and $Response.Content.message) {
-        Write-Host "    API: $($Response.Content.message)" -ForegroundColor Yellow
+    $msg = Get-SafeProperty $Response.Content 'message'
+    if ($msg) {
+        Write-Host "    API: $msg" -ForegroundColor Yellow
     }
 }
 
@@ -238,6 +239,21 @@ function Parse-Editor {
 }
 
 # ---------------------------------------------------------------------------
+# Safe Property Access
+# ---------------------------------------------------------------------------
+
+function Get-SafeProperty {
+    param($Obj, [string]$Name, $Default = $null)
+    if ($null -eq $Obj) { return $Default }
+    if ($Obj -is [hashtable]) {
+        if ($Obj.ContainsKey($Name)) { return $Obj[$Name] }
+        return $Default
+    }
+    if ($Obj.PSObject.Properties[$Name]) { return $Obj.$Name }
+    return $Default
+}
+
+# ---------------------------------------------------------------------------
 # Aggregate NDJSON Per User
 # ---------------------------------------------------------------------------
 
@@ -246,7 +262,8 @@ function Get-UserAggregates {
     $users = @{}
 
     foreach ($rec in $NdjsonRecords) {
-        $login = $rec.user_login
+        $login = $null
+        if ($rec.PSObject.Properties['user_login']) { $login = $rec.user_login }
         if (-not $login) { continue }
 
         if (-not $users.ContainsKey($login)) {
@@ -258,16 +275,17 @@ function Get-UserAggregates {
         }
         $u = $users[$login]
         $u.days_active   += 1
-        $u.interactions  += [int]($rec.user_initiated_interaction_count -as [int])
-        $u.code_gen      += [int]($rec.code_generation_activity_count -as [int])
-        $u.code_accept   += [int]($rec.code_acceptance_activity_count -as [int])
-        $u.loc_suggested += [int]($rec.loc_suggested_to_add_sum -as [int])
-        $u.loc_added     += [int]($rec.loc_added_sum -as [int])
-        $u.loc_deleted   += [int]($rec.loc_deleted_sum -as [int])
-        if ($rec.used_chat)   { $u.used_chat = $true }
-        if ($rec.used_agent)  { $u.used_agent = $true }
-        if ($rec.used_cli)    { $u.used_cli = $true }
-        if ($rec.used_copilot_code_review_active -or $rec.used_copilot_code_review_passive) {
+        $u.interactions  += [int](Get-SafeProperty $rec 'user_initiated_interaction_count' 0)
+        $u.code_gen      += [int](Get-SafeProperty $rec 'code_generation_activity_count' 0)
+        $u.code_accept   += [int](Get-SafeProperty $rec 'code_acceptance_activity_count' 0)
+        $u.loc_suggested += [int](Get-SafeProperty $rec 'loc_suggested_to_add_sum' 0)
+        $u.loc_added     += [int](Get-SafeProperty $rec 'loc_added_sum' 0)
+        $u.loc_deleted   += [int](Get-SafeProperty $rec 'loc_deleted_sum' 0)
+        if (Get-SafeProperty $rec 'used_chat' $false)   { $u.used_chat = $true }
+        if (Get-SafeProperty $rec 'used_agent' $false)   { $u.used_agent = $true }
+        if (Get-SafeProperty $rec 'used_cli' $false)     { $u.used_cli = $true }
+        if ((Get-SafeProperty $rec 'used_copilot_code_review_active' $false) -or
+            (Get-SafeProperty $rec 'used_copilot_code_review_passive' $false)) {
             $u.used_code_review = $true
         }
     }
@@ -310,12 +328,13 @@ function Build-OrgReport {
     $utilizations = @()
 
     foreach ($seat in $Seats) {
-        $assignee = $seat.assignee
-        if (-not $assignee -or -not $assignee.login) { continue }
-        $login = $assignee.login
+        $assignee = Get-SafeProperty $seat 'assignee'
+        if (-not $assignee) { continue }
+        $login = Get-SafeProperty $assignee 'login'
+        if (-not $login) { continue }
 
         # Last activity
-        $lastActivity = $seat.last_activity_at
+        $lastActivity = Get-SafeProperty $seat 'last_activity_at'
         $daysInactive = "never"
         $lastDate = "N/A"
         if ($lastActivity) {
@@ -327,7 +346,7 @@ function Build-OrgReport {
         }
 
         # Seat assigned date
-        $seatCreated = $seat.created_at
+        $seatCreated = Get-SafeProperty $seat 'created_at'
         $seatDate = "N/A"
         if ($seatCreated) {
             try { $seatDate = ([DateTimeOffset]::Parse($seatCreated)).ToString("yyyy-MM-dd") } catch {}
@@ -338,7 +357,7 @@ function Build-OrgReport {
         if ($status -eq "inactive") { $inactiveLogins += $login }
 
         # Editor parsing
-        $rawEditor = $seat.last_activity_editor
+        $rawEditor = Get-SafeProperty $seat 'last_activity_editor' ''
         $parsed = Parse-Editor -Raw $rawEditor
         $editorName = $parsed[0]
         $copilotModel = $parsed[1]
@@ -375,7 +394,7 @@ function Build-OrgReport {
             organization         = $Org
             user_login           = $login
             status               = $status
-            plan_type            = if ($seat.plan_type) { $seat.plan_type } else { "N/A" }
+            plan_type            = if (Get-SafeProperty $seat 'plan_type') { $seat.plan_type } else { "N/A" }
             seat_assigned_date   = $seatDate
             last_activity_date   = $lastDate
             days_inactive        = $daysInactive

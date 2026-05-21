@@ -513,9 +513,12 @@ else {
 }
 
 # Prepare output
+$OutputDir = (Resolve-Path $OutputDir -ErrorAction SilentlyContinue).Path
+if (-not $OutputDir) { $OutputDir = $PWD.Path }
 if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
 $today = (Get-Date).ToString("yyyyMMdd")
 $csvPath = Join-Path $OutputDir "copilot_report_$today.csv"
+Write-Host "Output directory: $OutputDir"
 
 $allRows = [System.Collections.ArrayList]::new()
 $rawData = @{}
@@ -564,4 +567,8 @@ if ($RawJson -and $rawData.Count -gt 0) {
     Write-Host "  `u{2705} Raw JSON `u{2192} $jsonPath"
 }
 
-Write-Host "`n`u{2705} Done! Report saved to $(Resolve-Path $csvPath)`n" -ForegroundColor Green
+if (Test-Path $csvPath) {
+    Write-Host "`n`u{2705} Done! Report saved to $csvPath`n" -ForegroundColor Green
+} else {
+    Write-Host "`n`u{26A0} Report file not found at $csvPath - check permissions.`n" -ForegroundColor Yellow
+}

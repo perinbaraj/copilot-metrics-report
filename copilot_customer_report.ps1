@@ -324,15 +324,15 @@ function Build-OrgReport {
     $now = [DateTimeOffset]::UtcNow
     $userAgg = Get-UserAggregates -NdjsonRecords $NdjsonRecords
 
-    $userRows = @()
-    $inactiveLogins = @()
+    $userRows = [System.Collections.ArrayList]::new()
+    $inactiveLogins = [System.Collections.ArrayList]::new()
     $editorCounts = @{}
     $totalInteractions = 0
     $totalCodeGen = 0
     $totalCodeAccept = 0
     $totalLocAdded = 0
     $totalLocDeleted = 0
-    $utilizations = @()
+    $utilizations = [System.Collections.ArrayList]::new()
 
     foreach ($seat in $Seats) {
         $assignee = Get-SafeProperty $seat 'assignee'
@@ -361,7 +361,7 @@ function Build-OrgReport {
 
         # Status
         $status = if ($lastActivity) { "active" } else { "inactive" }
-        if ($status -eq "inactive") { $inactiveLogins += $login }
+        if ($status -eq "inactive") { [void]$inactiveLogins.Add($login) }
 
         # Editor parsing
         $rawEditor = Get-SafeProperty $seat 'last_activity_editor' ''
@@ -382,7 +382,7 @@ function Build-OrgReport {
 
         $daysActive = $u.days_active
         $utilization = [math]::Round($daysActive / $script:ReportDays * 100, 1)
-        $utilizations += $utilization
+        [void]$utilizations.Add($utilization)
 
         $interactions = $u.interactions
         $codeGen = $u.code_gen
@@ -397,7 +397,7 @@ function Build-OrgReport {
 
         $features = Get-FeaturesUsed -U $u
 
-        $userRows += [PSCustomObject]@{
+        [void]$userRows.Add([PSCustomObject]@{
             organization         = $Org
             user_login           = $login
             status               = $status
@@ -417,11 +417,11 @@ function Build-OrgReport {
             total_loc_added      = $u.loc_added
             total_loc_deleted    = $u.loc_deleted
             features_used        = $features
-        }
+        })
     }
 
     # Sort: active first, then inactive
-    $userRows = @($userRows | Sort-Object @{Expression = { if ($_.status -eq "active") { 0 } else { 1 } }}, user_login)
+    $sorted = @($userRows | Sort-Object @{Expression = { if ($_.status -eq "active") { 0 } else { 1 } }}, user_login)
 
     # Org summary row
     $totalSeats = $Seats.Count
@@ -439,7 +439,7 @@ function Build-OrgReport {
     $inactiveField = if ($inactiveDisplay) { "Inactive: $inactiveDisplay" } else { "None inactive" }
 
     $summaryRow = [PSCustomObject]@{
-        organization         = "`u{2500}`u{2500} $Org SUMMARY `u{2500}`u{2500}"
+        organization         = "-- $Org SUMMARY --"
         user_login           = "$totalSeats seats"
         status               = "$activeCount active / $($inactiveLogins.Count) inactive"
         plan_type            = ""
@@ -460,8 +460,10 @@ function Build-OrgReport {
         features_used        = $inactiveField
     }
 
-    $userRows += $summaryRow
-    return $userRows
+    $result = [System.Collections.ArrayList]::new()
+    foreach ($r in $sorted) { [void]$result.Add($r) }
+    [void]$result.Add($summaryRow)
+    return ,$result.ToArray()
 }
 
 # ---------------------------------------------------------------------------
@@ -515,7 +517,7 @@ if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir
 $today = (Get-Date).ToString("yyyyMMdd")
 $csvPath = Join-Path $OutputDir "copilot_report_$today.csv"
 
-$allRows = @()
+$allRows = [System.Collections.ArrayList]::new()
 $rawData = @{}
 
 Write-Host "`n`u{1F4CA} Copilot Report `u{2014} $($script:ReportDays)-day window`n"
@@ -535,7 +537,8 @@ foreach ($org in $orgList) {
     }
 
     $rows = @(Build-OrgReport -Org $org -Seats $seats -NdjsonRecords $ndjson)
-    $allRows += $rows
+    Write-Host "   Rows generated: $($rows.Count)"
+    foreach ($r in $rows) { [void]$allRows.Add($r) }
 
     if ($RawJson) {
         $rawData[$org] = @{ seats = $seats; ndjson = $ndjson }
@@ -543,10 +546,14 @@ foreach ($org in $orgList) {
 }
 
 # Write CSV
-Write-Host "`n`u{1F4DD} Writing report ..."
-$allRows | Select-Object $script:ReportColumns | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+Write-Host "`n`u{1F4DD} Writing report ... ($($allRows.Count) total rows)"
+if ($allRows.Count -eq 0) {
+    Write-Host "  `u{26A0} No data to write. Check API access." -ForegroundColor Yellow
+} else {
+    $allRows | Select-Object $script:ReportColumns | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+}
 
-$userCount = @($allRows | Where-Object { -not $_.organization.StartsWith([char]0x2500) }).Count
+$userCount = @($allRows | Where-Object { -not $_.organization.StartsWith("--") }).Count
 $summaryCount = $allRows.Count - $userCount
 Write-Host "  `u{2705} $userCount users + $summaryCount org summaries `u{2192} $csvPath"
 

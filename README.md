@@ -10,6 +10,7 @@ CSV reports at user and organization levels. Available in **Python** and **Power
 | `copilot_customer_report.py` | Python | **Customer-ready** single CSV — 19 columns, zero empty, org summaries |
 | `copilot_customer_report.ps1` | PowerShell | Same output as above — no external dependencies |
 | `copilot_metrics_report.py` | Python | Detailed multi-CSV report (3 files) — full NDJSON metrics |
+| `copilot_productivity_report.py` | Python | **Productivity analysis** — formatted Excel with per-user KPIs, health classifications, and team summary |
 
 ## Quick Start
 
@@ -23,6 +24,10 @@ cp .env.example .env   # edit with your token
 # Customer report (recommended)
 python copilot_customer_report.py --enterprise my-enterprise
 python copilot_customer_report.py --orgs org1,org2 --token ghp_xxx
+
+# Productivity report (Excel with health classifications)
+python copilot_productivity_report.py --enterprise my-enterprise
+python copilot_productivity_report.py --orgs org1,org2 --token ghp_xxx
 ```
 
 ### PowerShell
@@ -89,6 +94,54 @@ my-org,bob,inactive,business,2025-02-01,N/A,never,N/A,N/A,0,0.0,0,0,0,0,0,0,0,no
 ── my-org SUMMARY ──,50 seats,42 active / 8 inactive,,,,,"Top: vscode, JetBrains-IU",,,"avg 48.2%",12500,6200,2100,33.9,,8500,1200,"Inactive: bob, charlie"
 ```
 
+## Productivity Report Output
+
+### Overview
+
+`copilot_productivity_{date}.xlsx` — formatted Excel workbook with per-user productivity analysis and team-level summary.
+
+### Sheet 1: User Productivity
+
+Per-user breakdown with auto-classified health profiles and color-coded indicators.
+
+| Column | Description |
+|--------|-------------|
+| `organization` | Org the user belongs to |
+| `user_login` | GitHub username |
+| `active_days` | Days with Copilot usage (out of 28) |
+| `adoption_rate_pct` | Active days / 28 × 100 |
+| `total_interactions` | Total prompts sent to Copilot |
+| `code_generations` | Code generation events |
+| `code_acceptances` | Accepted code suggestions |
+| `acceptance_rate_pct` | Acceptances / generations × 100 |
+| `loc_suggested` | Lines of code suggested by Copilot |
+| `loc_added` | Lines actually added to code |
+| `loc_deleted` | Lines deleted from code |
+| `net_loc_change` | loc_added − loc_deleted |
+| `copilot_contribution_pct` | loc_suggested / loc_added × 100 |
+| `chat_interactions` | Chat panel interactions (ask, edit, plan modes) |
+| `agent_interactions` | Agent mode interactions |
+| `features_used` | Features used: chat, agent, cli, code_review |
+| `engagement_depth` | chat + agent interactions |
+| `health_profile` | Auto-classified health label |
+| `health_notes` | Explanation of classification |
+
+### Health Profiles
+
+| Profile | Color | Criteria |
+|---------|-------|----------|
+| Power User | 🟢 Green | acceptance ≥ 30%, active ≥ 14 days, depth ≥ 50 |
+| Healthy | 🟢 Green | acceptance ≥ 25%, active ≥ 7 days |
+| Agent-Heavy | 🟡 Yellow | Agent-dominant usage, loc_added >> loc_suggested |
+| Chat-Focused | 🟡 Yellow | Chat usage with minimal code generation |
+| Moderate | 🔵 Blue | Active but room to grow |
+| Low Usage | 🔴 Red | 1-3 active days, <20 interactions |
+| Needs Enablement | 🔴 Red | No meaningful usage detected |
+
+### Sheet 2: Team Summary
+
+Consolidated KPIs including adoption rates, code acceleration metrics, engagement depth, feature adoption percentages, health distribution, top users by engagement, and users needing enablement.
+
 ## CLI Options
 
 ### Customer Report (Python)
@@ -110,6 +163,15 @@ my-org,bob,inactive,business,2025-02-01,N/A,never,N/A,N/A,0,0.0,0,0,0,0,0,0,0,no
 | `-Orgs` | `ORGS` | — | Comma-separated org slugs |
 | `-OutputDir` | `OUTPUT_DIR` | `.` | Output directory |
 | `-RawJson` | — | off | Also save raw API JSON |
+
+### Productivity Report (Python — `copilot_productivity_report.py`)
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--token` | `GITHUB_TOKEN` | — | GitHub PAT |
+| `--enterprise` | `ENTERPRISE_SLUG` | — | Enterprise slug (auto-discovers all orgs) |
+| `--orgs` | `ORGS` | — | Comma-separated org slugs (overrides `--enterprise`) |
+| `--output-dir` | `OUTPUT_DIR` | `.` | Directory for report output |
 
 ### Detailed Report (Python — `copilot_metrics_report.py`)
 

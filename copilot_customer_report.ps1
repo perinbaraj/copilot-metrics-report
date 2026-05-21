@@ -460,10 +460,9 @@ function Build-OrgReport {
         features_used        = $inactiveField
     }
 
-    $result = [System.Collections.ArrayList]::new()
-    foreach ($r in $sorted) { [void]$result.Add($r) }
-    [void]$result.Add($summaryRow)
-    return ,$result.ToArray()
+    # Return all rows - emit each to pipeline
+    foreach ($r in $sorted) { $r }
+    $summaryRow
 }
 
 # ---------------------------------------------------------------------------
@@ -553,7 +552,35 @@ Write-Host "`n`u{1F4DD} Writing report ... ($($allRows.Count) total rows)"
 if ($allRows.Count -eq 0) {
     Write-Host "  `u{26A0} No data to write. Check API access." -ForegroundColor Yellow
 } else {
-    $allRows | Select-Object $script:ReportColumns | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+    try {
+        $allRows | Select-Object $script:ReportColumns | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+        Write-Host "  Export-Csv completed."
+    }
+    catch {
+        Write-Host "  `u{26A0} Export-Csv failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        # Fallback: write manually
+        Write-Host "  Trying manual CSV write..."
+        try {
+            $header = $script:ReportColumns -join ","
+            $lines = [System.Collections.ArrayList]::new()
+            [void]$lines.Add($header)
+            foreach ($row in $allRows) {
+                $vals = @()
+                foreach ($col in $script:ReportColumns) {
+                    $v = ""
+                    if ($row.PSObject.Properties[$col]) { $v = "$($row.$col)" }
+                    if ($v -match '[,"]') { $v = '"' + ($v -replace '"', '""') + '"' }
+                    $vals += $v
+                }
+                [void]$lines.Add($vals -join ",")
+            }
+            $lines | Set-Content -Path $csvPath -Encoding UTF8
+            Write-Host "  Manual CSV write completed."
+        }
+        catch {
+            Write-Host "  `u{26A0} Manual write also failed: $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
 }
 
 $userCount = @($allRows | Where-Object { -not $_.organization.StartsWith("--") }).Count

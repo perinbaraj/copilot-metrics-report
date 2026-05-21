@@ -131,25 +131,41 @@ function Get-Organizations {
     $headers = Get-AuthHeaders -TokenValue $TokenValue
     $orgList = [System.Collections.ArrayList]::new()
 
-    # Try enterprise endpoint
-    $resp = Invoke-GitHubApi -Url "$script:GitHubApiBase/enterprises/$EntSlug/organizations?per_page=100" -Headers $headers
-    if ($resp.StatusCode -eq 200 -and $resp.Content -is [array] -and $resp.Content.Count -gt 0) {
-        return @($resp.Content | ForEach-Object { $_.login } | Where-Object { $_ })
+    # Try enterprise endpoint (paginated)
+    $page = 1
+    $gotEntData = $false
+    while ($true) {
+        $resp = Invoke-GitHubApi -Url "$script:GitHubApiBase/enterprises/$EntSlug/organizations?per_page=100&page=$page" -Headers $headers
+        if ($resp.StatusCode -ne 200) { break }
+        $data = @($resp.Content)  # force array even for single item
+        if ($data.Count -eq 0) { break }
+        $gotEntData = $true
+        foreach ($o in $data) {
+            $login = Get-SafeProperty $o 'login'
+            if ($login) { [void]$orgList.Add($login) }
+        }
+        if ($data.Count -lt 100) { break }
+        $page++
     }
+    if ($gotEntData -and $orgList.Count -gt 0) { return @($orgList) }
 
     # Fallback: user orgs
     Write-Host "  `u{26A0} Enterprise endpoint unavailable. Using your org memberships." -ForegroundColor Yellow
+    $orgList.Clear()
     $page = 1
     while ($true) {
         $resp = Invoke-GitHubApi -Url "$script:GitHubApiBase/user/orgs?page=$page&per_page=100" -Headers $headers
         if ($resp.StatusCode -ne 200) { Write-ApiError $resp; break }
-        $data = $resp.Content
-        if (-not $data -or $data.Count -eq 0) { break }
-        foreach ($o in $data) { if ($o.login) { [void]$orgList.Add($o.login) } }
+        $data = @($resp.Content)
+        if ($data.Count -eq 0) { break }
+        foreach ($o in $data) {
+            $login = Get-SafeProperty $o 'login'
+            if ($login) { [void]$orgList.Add($login) }
+        }
         if ($data.Count -lt 100) { break }
         $page++
     }
-    return $orgList
+    return @($orgList)
 }
 
 # ---------------------------------------------------------------------------

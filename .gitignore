@@ -3,6 +3,11 @@ copilot_users_*.csv
 copilot_user_activity_*.csv
 copilot_org_summary_*.csv
 copilot_raw_*.json
+copilot_report_*.csv
+copilot_productivity_*.xlsx
+
+# Generated mock data
+mock_data/
 
 # Environment files with secrets
 .env

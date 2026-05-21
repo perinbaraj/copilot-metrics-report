@@ -11,6 +11,7 @@ CSV reports at user and organization levels. Available in **Python** and **Power
 | `copilot_customer_report.ps1` | PowerShell | Same output as above — no external dependencies |
 | `copilot_metrics_report.py` | Python | Detailed multi-CSV report (3 files) — full NDJSON metrics |
 | `copilot_productivity_report.py` | Python | **Productivity analysis** — formatted Excel with per-user KPIs, health classifications, and team summary |
+| `generate_mock_data.py` | Python | **Mock data** — generates 100 synthetic users with varied profiles for testing |
 
 ## Quick Start
 
@@ -28,6 +29,9 @@ python copilot_customer_report.py --orgs org1,org2 --token ghp_xxx
 # Productivity report (Excel with health classifications)
 python copilot_productivity_report.py --enterprise my-enterprise
 python copilot_productivity_report.py --orgs org1,org2 --token ghp_xxx
+
+# Generate mock data for testing (no API token needed)
+python generate_mock_data.py
 ```
 
 ### PowerShell
@@ -141,6 +145,44 @@ Per-user breakdown with auto-classified health profiles and color-coded indicato
 ### Sheet 2: Team Summary
 
 Consolidated KPIs including adoption rates, code acceleration metrics, engagement depth, feature adoption percentages, health distribution, top users by engagement, and users needing enablement.
+
+## Mock Data
+
+`generate_mock_data.py` creates realistic synthetic data for 100 GitHub Copilot users
+across 7 usage profiles — no API token required. Useful for testing reports and demos.
+
+```bash
+python generate_mock_data.py
+```
+
+**Output** (`mock_data/` directory):
+| File | Description |
+|------|-------------|
+| `mock_copilot_users.ndjson` | ~985 per-user-per-day records in exact API NDJSON format |
+| `mock_seats.json` | 100 seat assignments matching the billing/seats API schema |
+| `copilot_productivity_mock.xlsx` | Demo productivity report generated from the mock data |
+
+**User Profile Distribution:**
+| Profile | Count | Description |
+|---------|-------|-------------|
+| Power User | 10 | Heavy, effective usage across all features |
+| Healthy | 25 | Good adoption with consistent daily usage |
+| Agent-Heavy | 10 | Primary usage through agent/edit mode |
+| Chat-Focused | 10 | Uses Copilot for Q&A rather than code generation |
+| Moderate | 20 | Active but room to increase engagement |
+| Low Usage | 15 | Minimal usage, 1-3 active days |
+| Needs Enablement | 10 | No meaningful usage detected |
+
+## Metrics Documentation
+
+See **[COPILOT_METRICS_GUIDE.md](COPILOT_METRICS_GUIDE.md)** for a comprehensive reference covering:
+
+- 🌳 GitHub Copilot REST API endpoint tree (enterprise → org → user)
+- 📊 Complete NDJSON field reference with types and descriptions
+- 📈 Developer productivity measurement framework (4 dimensions)
+- 🎯 Composite KPIs with formulas and target ranges
+- 🏥 Health classification system and thresholds
+- ❓ Common patterns, gotchas, and FAQ
 
 ## CLI Options
 

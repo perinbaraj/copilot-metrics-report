@@ -46,6 +46,7 @@ GITHUB_API_BASE = "https://api.github.com"
 API_VERSION = "2022-11-28"
 REPORT_DAYS = 28
 MAX_PER_PAGE = 100
+MINUTES_SAVED_PER_ACCEPTANCE = 5  # conservative estimate per accepted suggestion
 
 USER_PRODUCTIVITY_COLUMNS = [
     "organization",
@@ -65,6 +66,7 @@ USER_PRODUCTIVITY_COLUMNS = [
     "agent_interactions",
     "features_used",
     "engagement_depth",
+    "estimated_time_saved_hrs",
     "health_profile",
     "health_notes",
 ]
@@ -420,6 +422,7 @@ def build_user_rows(org: str, seats: list[dict], ndjson_records: list[dict]) -> 
             "agent_interactions": agent_interactions,
             "features_used": build_features_list(aggregated),
             "engagement_depth": engagement_depth,
+            "estimated_time_saved_hrs": round(code_acceptances * MINUTES_SAVED_PER_ACCEPTANCE / 60, 1),
             "used_chat": bool(aggregated.get("used_chat", False)),
             "used_agent": bool(aggregated.get("used_agent", False)),
             "used_cli": bool(aggregated.get("used_cli", False)),
@@ -444,6 +447,10 @@ def build_team_summary(user_rows: list[dict[str, Any]], report_start: str, repor
     total_loc_added = sum(row["loc_added"] for row in user_rows)
     total_loc_deleted = sum(row["loc_deleted"] for row in user_rows)
     total_interactions = sum(row["total_interactions"] for row in user_rows)
+    total_estimated_time_saved = sum(row["estimated_time_saved_hrs"] for row in user_rows)
+    avg_time_saved_per_active_user = round(
+        total_estimated_time_saved / active_user_count, 1
+    ) if active_user_count else 0.0
 
     health_order = [
         "Power User",
@@ -481,6 +488,8 @@ def build_team_summary(user_rows: list[dict[str, Any]], report_start: str, repor
         "total_loc_added": total_loc_added,
         "total_loc_deleted": total_loc_deleted,
         "team_copilot_contribution_pct": _safe_pct(total_loc_suggested, total_loc_added, cap=100.0),
+        "total_estimated_time_saved_hrs": round(total_estimated_time_saved, 1),
+        "avg_time_saved_per_active_user_hrs": avg_time_saved_per_active_user,
         "total_interactions": total_interactions,
         "avg_engagement_depth_per_user": round(
             sum(row["engagement_depth"] for row in user_rows) / total_users, 1
@@ -534,6 +543,9 @@ def write_excel(output_path: Path, user_rows: list[dict[str, Any]], summary: dic
         "acceptance_rate_pct",
         "copilot_contribution_pct",
     }
+    decimal_columns = {
+        "estimated_time_saved_hrs",
+    }
     number_columns = {
         "active_days",
         "total_interactions",
@@ -552,6 +564,8 @@ def write_excel(output_path: Path, user_rows: list[dict[str, Any]], summary: dic
 
     for row_idx in range(2, user_ws.max_row + 1):
         for column_name in percentage_columns:
+            user_ws.cell(row=row_idx, column=header_index[column_name]).number_format = "0.0"
+        for column_name in decimal_columns:
             user_ws.cell(row=row_idx, column=header_index[column_name]).number_format = "0.0"
         for column_name in number_columns:
             user_ws.cell(row=row_idx, column=header_index[column_name]).number_format = "#,##0"
@@ -579,6 +593,11 @@ def write_excel(output_path: Path, user_rows: list[dict[str, Any]], summary: dic
         ("Total LOC Added", summary["total_loc_added"], "number"),
         ("Total LOC Deleted", summary["total_loc_deleted"], "number"),
         ("Team Copilot Contribution %", summary["team_copilot_contribution_pct"], "pct"),
+        ("", "", "blank"),
+        ("Productivity Impact", "", "section"),
+        ("Total Estimated Time Saved (hrs)", summary["total_estimated_time_saved_hrs"], "pct"),
+        ("Avg Time Saved per Active User (hrs)", summary["avg_time_saved_per_active_user_hrs"], "pct"),
+        ("Estimation Basis", f"{MINUTES_SAVED_PER_ACCEPTANCE} min per accepted suggestion (conservative)", "label"),
         ("", "", "blank"),
         ("Engagement", "", "section"),
         ("Total Interactions", summary["total_interactions"], "number"),

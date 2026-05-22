@@ -347,6 +347,68 @@ A strong productivity view does **not** rely on one metric. It combines **adopti
 | Copilot Code Contribution % | `min(loc_suggested / loc_added, 1.0) × 100` | `30%–70%` | Share of visible output that was suggestion-assisted |
 | Time Saved Estimate | `code_acceptances × avg_lines_per_completion × time_per_line` | N/A | Rough directional estimate of time saved |
 
+#### Estimating Time Saved with Copilot
+
+There is no direct "time saved" field in the API — you estimate it using accepted completions as a proxy:
+
+```text
+Time Saved (hours) = code_acceptances × MINUTES_PER_ACCEPTANCE / 60
+```
+
+| Variable | Value | Source |
+|----------|-------|--------|
+| `code_acceptances` | From API: `code_acceptance_activity_count` | Direct metric |
+| Minutes per acceptance | **5 minutes** (conservative) | Industry benchmark: writing 3-5 lines of code manually takes ~5-10 minutes including thinking, typing, and verifying |
+
+> 📊 **Research backing**: GitHub's randomized controlled trials with 4,867 developers found Copilot users completed coding tasks **26–55% faster** than non-users. The 5 min/acceptance estimate is conservative and directional.
+>
+> Source: [The Impact of AI on Developer Productivity: Evidence from GitHub Copilot](https://www.microsoft.com/en-us/research/publication/the-impact-of-ai-on-developer-productivity-evidence-from-github-copilot/) (Microsoft/MIT/Princeton/Wharton, 2024)
+
+**Worked Example:**
+
+| User | code_acceptances | Estimated Time Saved | Per Day (28-day window) |
+|------|-----------------|---------------------|------------------------|
+| User A (Power User) | 401 | `401 × 5 / 60 = 33.4 hrs` | ~1.2 hrs/day |
+| User B (Healthy) | 137 | `137 × 5 / 60 = 11.4 hrs` | ~0.4 hrs/day |
+| User C (Low Usage) | 56 | `56 × 5 / 60 = 4.7 hrs` | ~0.2 hrs/day |
+| **Team of 100** | **5,200** | **`5,200 × 5 / 60 = 433 hrs`** | **~15.5 hrs/day saved** |
+
+> ⚠️ **Important caveats:**
+> - This is a **directional estimate**, not a precise measurement
+> - Actual time saved varies by language, task complexity, and developer experience
+> - Not all acceptances represent equal time savings (a 1-line import vs. a 20-line function)
+> - Some accepted code may still require modification after acceptance
+> - Use this metric for **trend analysis and ROI discussions**, not performance evaluation
+
+#### Understanding Copilot's Contribution to Output
+
+```text
+Copilot Contribution % = min(loc_suggested_to_add_sum / loc_added_sum, 1.0) × 100
+```
+
+This metric shows what percentage of the developer's final code output was assisted by Copilot through **inline suggestions and chat**. However, there is a critical nuance:
+
+| Metric | What It Captures | What It Excludes |
+|--------|-----------------|-----------------|
+| `loc_suggested_to_add_sum` | Inline completions, chat panel suggestions | Agent/edit mode edits |
+| `loc_added_sum` | **Everything** — completions + chat + agent edits | Nothing |
+
+This means:
+
+| Scenario | loc_suggested | loc_added | Contribution % | Interpretation |
+|----------|--------------|-----------|-----------------|----------------|
+| **Selective user** | 4,855 | 800 | 100% (capped) | Copilot suggested heavily; user was selective — accepted only the best suggestions |
+| **Balanced user** | 959 | 1,500 | 63.9% | Good mix of Copilot-assisted and manual code |
+| **Agent-heavy user** | 38 | 1,422 | 2.7% | Almost all code via agent mode — **not a low value!** |
+| **Agent-heavy user** | 10 | 200 | 5.0% | Agent writes directly into files, bypassing suggestion pipeline |
+
+> 💡 **Key insight**: A low Copilot Contribution % with high `loc_added_sum` is actually a sign of **advanced adoption** — the developer is using agent mode where Copilot writes code directly into files rather than offering inline suggestions. The "contribution" is happening through a different channel that `loc_suggested_to_add_sum` doesn't capture.
+
+**For a complete picture of Copilot's contribution, consider:**
+1. **Suggestion Contribution**: `loc_suggested / loc_added` — what % came through suggestions
+2. **Agent Contribution**: `(loc_added - loc_suggested) / loc_added` — rough proxy for agent-written code (when `loc_added > loc_suggested`)
+3. **Total AI Contribution**: High when either channel shows strong numbers
+
 ### ⚠️ Interpretation gotchas
 
 1. **Acceptance rate below 20% is not automatically bad.** Some domains are less completion-friendly.
@@ -401,6 +463,7 @@ A strong productivity view does **not** rely on one metric. It combines **adopti
 | **Adoption Rate** | `active_days / 28 × 100` | Is the user actually using Copilot? | `≥ 50%` |
 | **Acceptance Quality** | `code_acceptance_activity_count / code_generation_activity_count × 100` | Are suggestions useful? | `25%–40%` |
 | **Copilot Code Contribution %** | `loc_suggested_to_add_sum / loc_added_sum × 100` | How much output was suggestion-assisted? | `30%–70%` |
+| **Estimated Time Saved** | `code_acceptances × 5 min / 60` | Directional time savings estimate | Varies |
 | **Engagement Depth** | `chat_interactions + agent_interactions` | How deeply are features being used? | `≥ 20` |
 | **Feature Breadth** | Count of distinct features / modes used | Is the user moving beyond completions only? | `≥ 2` |
 | **Team Health Score** | Weighted average of adoption, acceptance, engagement | Overall team readiness / maturity | Context-dependent |
@@ -494,6 +557,7 @@ engagement_depth         = chat_interactions + agent_interactions
 feature_breadth          = count(used_chat, used_agent, used_cli, code_review flags set to true)
 loc_changed_with_ai      = loc_added_sum + loc_deleted_sum
 copilot_contribution_pct = min(loc_suggested_to_add_sum / loc_added_sum, 1.0) * 100
+estimated_time_saved_hrs = code_acceptance_activity_count * 5 / 60
 ```
 
 ### Step 3 — Aggregate to team or org level

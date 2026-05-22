@@ -261,9 +261,22 @@ def fetch_ndjson(token: str, org: str) -> tuple[list[dict], str, str]:
             print(f"   📥 NDJSON report: {report_start} → {report_end} ({len(links)} file(s))")
 
         for link in links:
-            dl = client.get(link, timeout=120)
-            if dl.status_code in (401, 403):
-                dl = client.get(link, headers=_headers(token), timeout=120)
+            try:
+                dl = client.get(link, timeout=120)
+                if dl.status_code in (401, 403):
+                    dl = client.get(link, headers=_headers(token), timeout=120)
+            except httpx.ConnectError:
+                print(f"   ⚠ Network error downloading NDJSON file — retrying …")
+                try:
+                    import time as _time
+                    _time.sleep(3)
+                    dl = client.get(link, headers=_headers(token), timeout=120)
+                except httpx.ConnectError:
+                    print(f"   ❌ Download failed (DNS/network error). Check your internet connection.")
+                    continue
+            except httpx.TimeoutException:
+                print(f"   ⚠ Download timed out — skipping file.")
+                continue
             if dl.status_code != 200:
                 continue
             for line in dl.text.strip().splitlines():

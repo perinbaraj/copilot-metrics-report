@@ -547,6 +547,29 @@ One NDJSON row
 × one organization or enterprise scope
 ```
 
+### Step 1.5 — Report column name mapping
+
+The productivity report uses shortened column names for readability. Here is the exact mapping between API fields and report columns:
+
+| Report Column | API Field (NDJSON) | Type |
+|---|---|---|
+| `code_generations` | `code_generation_activity_count` | Sum across 28 days |
+| `code_acceptances` | `code_acceptance_activity_count` | Sum across 28 days |
+| `loc_suggested` | `loc_suggested_to_add_sum` | Sum across 28 days |
+| `loc_added` | `loc_added_sum` | Sum across 28 days |
+| `loc_deleted` | `loc_deleted_sum` | Sum across 28 days |
+| `active_days` | Count of distinct `day` records per user | Derived |
+| `adoption_rate_pct` | `active_days / 28 × 100` | Derived (%) |
+| `acceptance_rate_pct` | `code_acceptances / code_generations × 100` | Derived (%) |
+| `copilot_contribution_pct` | `min(loc_suggested / loc_added, 1.0) × 100` | Derived (%, capped at 100) |
+| `net_loc_change` | `loc_added − loc_deleted` | Derived |
+| `chat_interactions` | Sum of `chat_panel_ask_mode` + `edit_mode` + `plan_mode` + `custom_mode` | Derived (excludes agent mode) |
+| `agent_interactions` | `chat_panel_agent_mode` | Sum across 28 days |
+| `engagement_depth` | `chat_interactions + agent_interactions` | Derived |
+| `estimated_time_saved_hrs` | `code_acceptances × 5 / 60` | Derived (hours) |
+
+> **Why `_pct`?** Columns ending in `_pct` are calculated **percentages**, not raw API values. They help interpret the data without manual math.
+
 ### Step 2 — Derive user-level KPIs
 
 ```text

@@ -555,6 +555,15 @@ That ordering prevents advanced agent users from being incorrectly labeled as we
 
 **What still uses the panel-only counters:** the `chat_interactions` and `agent_interactions` columns are kept as breakdown columns (useful when populated) and the `Chat-Focused` / `Agent-Heavy` health profiles still use them. For users where panel-mode is always 0 you'll see those classifications less often even though Power User / Healthy / Moderate continue to work correctly.
 
+### Q: The script prints `Seats: 0 (status: ok)` for every org but NDJSON activity is present. What's wrong?
+**A:** Nothing on the API side. `status: ok` means the seats endpoint returned **HTTP 200 with an empty list**, not an error. Three things can produce this:
+
+1. **The activity is from users on Copilot Pro / Individual (personal subscription).** They show up in NDJSON because they're org members using personal Copilot, but the org has no org-assigned seats. `Seat Assigned Date` will be **correctly blank** for these users — there's no seat to read a `created_at` from. This is the most common cause when you're testing on your own personal-account orgs.
+2. **The org is under enterprise-level seat management (Copilot Enterprise).** Org-level `/orgs/{org}/copilot/billing/seats` returns empty because the seats are assigned at the enterprise level. **Fix:** re-run with `--enterprise <real-enterprise-slug>`. The script now automatically falls back to `/enterprises/{enterprise}/copilot/billing/seats` and buckets the seats back per org. The `<slug>` is your enterprise account name (e.g. `acme-corp`), **not** your GitHub username.
+3. **The org has Copilot Business but no users assigned yet.** Visit `https://github.com/organizations/<org>/settings/copilot/seat_management` to confirm.
+
+The script now prints a loud `⚠ N org(s) still have 0 seats but show Copilot activity` block at the end of each run when this happens, with the same diagnosis.
+
 ### Q: `Seat Assigned Date` and `Last Activity Date` are blank for **some** users but not all (and the API didn't error).
 **A:** Until v0.4 this happened silently when the user's GitHub login differed in casing between the seats endpoint and the user-level NDJSON. For example: NDJSON returned `pthangavel_pebin` while seats returned `Pthangavel_Pebin`. The old code did an exact-case dict lookup and silently dropped to `None` — making it look like the user had no seat record.
 

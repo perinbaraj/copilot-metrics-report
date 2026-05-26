@@ -357,6 +357,105 @@ def fetch_seats(token: str, org: str, debug: bool = False) -> tuple[list[dict], 
     return seats, last_status
 
 
+def fetch_enterprise_seats(
+    token: str, enterprise: str, debug: bool = False
+) -> tuple[dict[str, list[dict]], str]:
+    """Fetch Copilot seats from the ENTERPRISE-level endpoint and group by org.
+
+    Returns (org_to_seats, status). Used as a fallback when the per-org
+    endpoint returns empty for orgs managed under an enterprise-wide
+    Copilot subscription. Each seat in the response carries an
+    ``organization`` field telling us which child org granted the seat.
+
+    Endpoint:  GET /enterprises/{enterprise}/copilot/billing/seats
+    Required:  manage_billing:copilot  OR  read:enterprise scope, AND the
+               user must be an enterprise owner or billing manager.
+    """
+    org_to_seats: dict[str, list[dict]] = {}
+    page = 1
+    last_status = "ok"
+    raw_pages: list[dict] = []
+    total_seats = 0
+    with httpx.Client(timeout=30) as client:
+        while True:
+            try:
+                resp = client.get(
+                    f"{GITHUB_API_BASE}/enterprises/{enterprise}/copilot/billing/seats",
+                    headers=_headers(token),
+                    params={"page": page, "per_page": MAX_PER_PAGE},
+                )
+            except (httpx.ConnectError, httpx.TimeoutException) as exc:
+                print(f"   ⚠ Network error fetching enterprise seats: {exc}")
+                return org_to_seats, "error"
+
+            if resp.status_code in (403, 429) and _handle_rate_limit(resp):
+                continue
+            if resp.status_code != 200:
+                if resp.status_code == 403:
+                    last_status = "forbidden"
+                    print(
+                        f"   ⚠ Enterprise seats endpoint returned HTTP 403. "
+                        f"Token needs 'manage_billing:copilot' or 'read:enterprise', "
+                        f"AND you must be an enterprise owner / billing manager."
+                    )
+                elif resp.status_code == 404:
+                    last_status = "not_found"
+                    print(
+                        f"   ⚠ Enterprise seats endpoint returned HTTP 404. "
+                        f"Enterprise '{enterprise}' either doesn't exist or has no "
+                        f"Copilot Business/Enterprise subscription."
+                    )
+                else:
+                    last_status = f"http_{resp.status_code}"
+                    print(
+                        f"   ⚠ Enterprise seats endpoint returned HTTP "
+                        f"{resp.status_code}."
+                    )
+                _try_print_response(resp)
+                break
+            try:
+                data = resp.json()
+            except json.JSONDecodeError:
+                last_status = "error"
+                print("   ⚠ Enterprise seats response was not valid JSON.")
+                break
+            raw_pages.append(data)
+            page_seats = data.get("seats", []) or []
+            if not page_seats:
+                break
+            for seat in page_seats:
+                org_obj = seat.get("organization") or {}
+                org_login = org_obj.get("login") if isinstance(org_obj, dict) else None
+                if not org_login:
+                    # Some enterprise seats are granted via enterprise teams
+                    # rather than orgs. Bucket those under a synthetic key so
+                    # we don't drop the seat data entirely.
+                    org_login = "__enterprise_team__"
+                org_to_seats.setdefault(org_login, []).append(seat)
+                total_seats += 1
+            if total_seats >= data.get("total_seats", total_seats):
+                break
+            page += 1
+
+    if debug and (raw_pages or last_status != "ok"):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        debug_path = Path(
+            f"debug_enterprise_seats_{_safe_filename(enterprise)}_{ts}.json"
+        )
+        try:
+            debug_path.write_text(
+                json.dumps(
+                    {"status": last_status, "pages": raw_pages}, indent=2
+                ),
+                encoding="utf-8",
+            )
+            print(f"   🐛 [debug] saved raw enterprise seats payload → {debug_path}")
+        except OSError as exc:
+            print(f"   ⚠ Could not write debug enterprise seats payload: {exc}")
+
+    return org_to_seats, last_status
+
+
 def fetch_ndjson(token: str, org: str, debug: bool = False) -> tuple[list[dict], str, str]:
     """Fetch per-user NDJSON usage metrics and report period metadata."""
     records: list[dict] = []
@@ -1275,6 +1374,7 @@ def main() -> None:
     report_starts: list[str] = []
     report_ends: list[str] = []
     all_records: list[dict] = []
+    empty_seat_orgs_with_activity: list[str] = []
 
     for org in orgs:
         print(f"🔍 {org}")
@@ -1284,6 +1384,9 @@ def main() -> None:
 
         ndjson_records, report_start, report_end = fetch_ndjson(token, org, debug=args.debug)
         print(f"   NDJSON records: {len(ndjson_records)}")
+
+        if status == "ok" and not seats and ndjson_records:
+            empty_seat_orgs_with_activity.append(org)
 
         if report_start:
             report_starts.append(report_start)
@@ -1304,6 +1407,69 @@ def main() -> None:
 
     if not org_payloads:
         sys.exit("ERROR: No reportable user data found.")
+
+    # Enterprise-level seats fallback. Per-org /orgs/{org}/copilot/billing/seats
+    # returns HTTP 200 with seats:[] when the org's Copilot subscription is
+    # managed centrally at the enterprise level (Copilot Enterprise). The
+    # authoritative source in that case is
+    # /enterprises/{enterprise}/copilot/billing/seats, which carries an
+    # `organization` field per seat so we can bucket them back per org.
+    if empty_seat_orgs_with_activity and enterprise:
+        print(
+            f"\n🏢 {len(empty_seat_orgs_with_activity)} org(s) had 0 seats but show NDJSON activity. "
+            f"Trying enterprise-level seats endpoint as a fallback …"
+        )
+        ent_seats_by_org, ent_status = fetch_enterprise_seats(
+            token, enterprise, debug=args.debug
+        )
+        if ent_seats_by_org:
+            total_ent_seats = sum(len(v) for v in ent_seats_by_org.values())
+            print(
+                f"   ✅ Enterprise endpoint returned {total_ent_seats} seat(s) "
+                f"across {len(ent_seats_by_org)} org(s). Merging into per-org data."
+            )
+            for payload in org_payloads:
+                org_name = payload["org"]
+                if not payload["seats"] and org_name in ent_seats_by_org:
+                    payload["seats"] = ent_seats_by_org[org_name]
+                    seat_status[org_name] = "ok_enterprise"
+                    print(
+                        f"   🔁 {org_name}: backfilled "
+                        f"{len(payload['seats'])} seat(s) from enterprise endpoint."
+                    )
+        else:
+            print(
+                f"   ⚠ Enterprise endpoint returned no seats either "
+                f"(status: {ent_status}). The orgs likely have no Copilot "
+                f"Business/Enterprise subscription — see message below."
+            )
+
+    # Re-compute which orgs still have 0 seats + activity after the fallback.
+    still_empty = [
+        p["org"]
+        for p in org_payloads
+        if not p["seats"] and p["records"]
+    ]
+    if still_empty:
+        print(
+            f"\n⚠ {len(still_empty)} org(s) still have 0 seats but show Copilot activity in NDJSON:"
+        )
+        for org in still_empty:
+            print(f"     • {org}")
+        print(
+            "\n   What this means:\n"
+            "   • The seats API is NOT failing — it's returning HTTP 200 with an empty list.\n"
+            "   • Your PAT scopes/permissions are NOT the issue.\n"
+            "   • Likely cause: the activity is from users on a personal Copilot Pro / Individual\n"
+            "     subscription (not org-assigned seats), so there's no org-level seat record to read\n"
+            "     a `created_at` from. `Seat Assigned Date` will be blank for these users —\n"
+            "     that's accurate, not a bug.\n"
+            "   • If the org IS supposed to have Copilot Business/Enterprise:\n"
+            "       1) Pass --enterprise <slug> (NOT your username) to use the enterprise endpoint.\n"
+            "       2) Confirm the org actually has assigned seats at\n"
+            "          https://github.com/organizations/<org>/settings/copilot/seat_management.\n"
+            "   • `Last Activity Date` is still backfilled from NDJSON, so the report remains useful.\n"
+        )
 
     # Global dedupe — the user-level NDJSON returns each user's global metrics
     # for every org they hold a seat in. Without this, totals get multiplied by

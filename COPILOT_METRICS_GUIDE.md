@@ -555,6 +555,11 @@ That ordering prevents advanced agent users from being incorrectly labeled as we
 
 **What still uses the panel-only counters:** the `chat_interactions` and `agent_interactions` columns are kept as breakdown columns (useful when populated) and the `Chat-Focused` / `Agent-Heavy` health profiles still use them. For users where panel-mode is always 0 you'll see those classifications less often even though Power User / Healthy / Moderate continue to work correctly.
 
+### Q: `Seat Assigned Date` and `Last Activity Date` are blank for **some** users but not all (and the API didn't error).
+**A:** Until v0.4 this happened silently when the user's GitHub login differed in casing between the seats endpoint and the user-level NDJSON. For example: NDJSON returned `pthangavel_pebin` while seats returned `Pthangavel_Pebin`. The old code did an exact-case dict lookup and silently dropped to `None` — making it look like the user had no seat record.
+
+**Fix in current version:** seat lookups are now case-insensitive (we key the seat map by `login.lower()`). If you still see this, run with `--debug` — the script now prints how many seats had `assignee.login` and `created_at` populated, plus the first-seat field keys so you can spot any GitHub field-name changes.
+
 ### Q: `Seat Assigned Date` and `Last Activity Date` are blank for all users in one or more orgs.
 **A:** The seats endpoint (`/orgs/{org}/copilot/billing/seats`) returned a non-success status. Common causes:
 

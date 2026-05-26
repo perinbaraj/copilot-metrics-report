@@ -620,6 +620,7 @@ def build_user_rows(
     ndjson_records: list[dict] | None = None,
     report_end: str = "",
     global_aggregation: dict[str, dict[str, Any]] | None = None,
+    debug: bool = False,
 ) -> list[dict[str, Any]]:
     """Build per-user rows for one org.
 
@@ -634,12 +635,44 @@ def build_user_rows(
     org-scoped `ndjson_records` (legacy / single-org callers like the mock
     generator).
     """
+    # Case-insensitive seat lookup: NDJSON typically returns lowercase logins,
+    # but the seats endpoint preserves the original GitHub casing. Without case
+    # normalization, a user `Pthangavel_Pebin` in seats would never match
+    # `pthangavel_pebin` in NDJSON — seat dates would silently drop to None
+    # AND the user could appear as two separate rows (one from seats, one from
+    # NDJSON). We key all lookups by `login.lower()` and prefer the NDJSON
+    # casing for the display login when both sources have the user.
     seat_map: dict[str, dict] = {}
+    seat_display_login: dict[str, str] = {}
+    seats_with_login = 0
+    seats_with_created_at = 0
     for seat in seats:
         assignee = seat.get("assignee", {}) or {}
         login = assignee.get("login", "")
         if login:
-            seat_map[login] = seat
+            key = login.lower()
+            seat_map[key] = seat
+            seat_display_login[key] = login
+            seats_with_login += 1
+            if seat.get("created_at"):
+                seats_with_created_at += 1
+
+    if debug and seats:
+        first_seat = seats[0]
+        first_keys = sorted(first_seat.keys())
+        assignee_keys = sorted((first_seat.get("assignee") or {}).keys()) if isinstance(first_seat.get("assignee"), dict) else []
+        print(
+            f"   🐛 [debug] {org}: {len(seats)} seat(s) fetched, "
+            f"{seats_with_login} have assignee.login, "
+            f"{seats_with_created_at} have non-null created_at"
+        )
+        print(f"   🐛 [debug] first seat top-level keys:  {first_keys}")
+        print(f"   🐛 [debug] first seat assignee.* keys: {assignee_keys}")
+        if seats_with_created_at == 0:
+            print(
+                f"   ⚠ All seats in {org} have a null/missing 'created_at' field. "
+                f"GitHub may have renamed it. Inspect the saved debug_seats_*.json."
+            )
 
     baseline_date = _parse_iso_date(report_end) or datetime.utcnow().date()
     if global_aggregation is not None:
@@ -653,11 +686,22 @@ def build_user_rows(
         ndjson_agg = aggregate_user_ndjson(ndjson_records or [])
         org_logins = set(ndjson_agg.keys())
 
-    all_logins = sorted(set(seat_map) | org_logins)
+    # Union of all logins (case-folded). Prefer NDJSON's casing for display
+    # because that's what GitHub uses in audit logs / activity dashboards;
+    # fall back to the seat assignee.login casing for seat-only users.
+    canonical: dict[str, str] = {}
+    for login in org_logins:
+        if login:
+            canonical[login.lower()] = login
+    for key, display in seat_display_login.items():
+        canonical.setdefault(key, display)
+
+    all_keys = sorted(canonical.keys())
     rows: list[dict[str, Any]] = []
 
-    for login in all_logins:
-        aggregated = ndjson_agg.get(login, {})
+    for key in all_keys:
+        login = canonical[key]
+        aggregated = ndjson_agg.get(login) or ndjson_agg.get(key) or {}
         active_days = aggregated.get("active_days", 0)
         total_interactions = aggregated.get("total_interactions", 0)
         code_generations = aggregated.get("code_generations", 0)
@@ -677,7 +721,7 @@ def build_user_rows(
         # are populated only when chat_panel_*_mode counters are populated.
         engagement_depth = total_interactions
 
-        seat = seat_map.get(login, {})
+        seat = seat_map.get(key, {})
         assigned_date = _parse_iso_date(seat.get("created_at"))
         last_activity_date = _parse_iso_date(seat.get("last_activity_at"))
 
@@ -725,7 +769,7 @@ def build_user_rows(
             "used_agent": bool(aggregated.get("used_agent", False)),
             "used_cli": bool(aggregated.get("used_cli", False)),
             "used_code_review": bool(aggregated.get("used_code_review", False)),
-            "plan_type": (seat.get("plan_type") or "") if login in seat_map else "",
+            "plan_type": (seat.get("plan_type") or "") if key in seat_map else "",
             "_active_day_set": aggregated.get("active_day_set", frozenset()),
         }
         row["health_profile"], row["health_notes"] = classify_health(row)
@@ -1287,8 +1331,16 @@ def main() -> None:
             payload["records"],
             report_end=payload["report_end"] or overall_report_end,
             global_aggregation=global_aggregation,
+            debug=args.debug,
         )
-        print(f"   📊 {payload['org']}: {len(user_rows)} row(s)")
+        if args.debug:
+            with_dates = sum(1 for r in user_rows if r.get("seat_assigned_date"))
+            print(
+                f"   📊 {payload['org']}: {len(user_rows)} row(s) "
+                f"({with_dates} with seat_assigned_date populated)"
+            )
+        else:
+            print(f"   📊 {payload['org']}: {len(user_rows)} row(s)")
         all_user_rows.extend(user_rows)
 
     if not all_user_rows:

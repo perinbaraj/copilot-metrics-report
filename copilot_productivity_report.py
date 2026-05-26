@@ -667,7 +667,15 @@ def build_user_rows(
         loc_deleted = aggregated.get("loc_deleted", 0)
         chat_interactions = aggregated.get("chat_interactions", 0)
         agent_interactions = aggregated.get("agent_interactions", 0)
-        engagement_depth = chat_interactions + agent_interactions
+        # Engagement depth = active prompts sent to Copilot across ALL surfaces
+        # (chat panel, inline chat, terminal chat, github.com chat, agent). This
+        # is `user_initiated_interaction_count` which by definition excludes passive
+        # completions, mode-switches, and shortcuts. Using only the chat_panel_*_mode
+        # counters undercounted users who use chat outside the panel (e.g. inline chat
+        # in the editor) — they'd show engagement_depth=0 despite used_chat=true.
+        # chat_interactions and agent_interactions are kept as breakdown columns and
+        # are populated only when chat_panel_*_mode counters are populated.
+        engagement_depth = total_interactions
 
         seat = seat_map.get(login, {})
         assigned_date = _parse_iso_date(seat.get("created_at"))
@@ -792,7 +800,7 @@ def dedupe_users_across_orgs(
         merged["acceptance_rate_pct"] = _safe_pct(merged["code_acceptances"], merged["code_generations"])
         merged["net_loc_change"] = merged["loc_added"] - merged["loc_deleted"]
         merged["copilot_contribution_pct"] = _safe_pct(merged["loc_suggested"], merged["loc_added"], cap=100.0)
-        merged["engagement_depth"] = merged["chat_interactions"] + merged["agent_interactions"]
+        merged["engagement_depth"] = merged["total_interactions"]
         merged["estimated_time_saved_hrs"] = round(
             merged["code_acceptances"] * MINUTES_SAVED_PER_ACCEPTANCE / 60, 1
         )

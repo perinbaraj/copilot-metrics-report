@@ -330,7 +330,7 @@ A strong productivity view does **not** rely on one metric. It combines **adopti
 | KPI | Formula | Target | What It Means |
 |---|---|---|---|
 | Adoption Rate | `active_days / 28 × 100` | `≥ 50%` | Copilot is part of the user's normal workflow |
-| Engagement Depth | `Σ(chat_interactions + agent_interactions)` | Varies | Depth of real usage, not just seat possession |
+| Engagement Depth | `Σ user_initiated_interaction_count` | Varies | Depth of real usage, not just seat possession (counts active prompts across **all** Copilot surfaces) |
 | Feature Breadth | Count of distinct features used | `≥ 2` | Indicates mature adoption beyond one narrow use case |
 
 ### Interpretation guide
@@ -473,7 +473,7 @@ This means:
 | **Acceptance Quality** | `code_acceptance_activity_count / code_generation_activity_count × 100` | Are suggestions useful? | `25%–40%` |
 | **Copilot Code Contribution %** | `loc_suggested_to_add_sum / loc_added_sum × 100` | How much output was suggestion-assisted? | `30%–70%` |
 | **Estimated Time Saved** | `code_acceptances × 5 min / 60` | Directional time savings estimate | Varies |
-| **Engagement Depth** | `chat_interactions + agent_interactions` | How deeply are features being used? | `≥ 20` |
+| **Engagement Depth** | `Σ user_initiated_interaction_count` | How deeply are features being used (across **all** Copilot surfaces)? | `≥ 50` |
 | **Feature Breadth** | Count of distinct features / modes used | Is the user moving beyond completions only? | `≥ 2` |
 | **Team Health Score** | Weighted average of adoption, acceptance, engagement | Overall team readiness / maturity | Context-dependent |
 
@@ -546,6 +546,15 @@ That ordering prevents advanced agent users from being incorrectly labeled as we
 ### Q: My report shows the same user listed under multiple orgs with **identical** numbers. Is the data wrong?
 **A:** No — that's expected. The user-level NDJSON returns each user's **global** Copilot activity for every org they hold a seat in (see the warning in §2.2). The toolkit dedupes by `(user_login, day)` before computing the Team Summary and Unique Users sheet, so totals are accurate. Per-org rows are kept so you can see which orgs each user is enrolled in; treat them as membership rows, not independent activity rows.
 
+### Q: `engagement_depth` shows 0 even though `features_used` says `chat, agent`.
+**A:** This was a known issue and is now fixed.
+
+**Why it happened:** the old formula was `engagement_depth = chat_interactions + agent_interactions`, where those columns sum **only** the `chat_panel_*_mode` counters. Those counters only fire when chat is used via the **IDE chat panel**. If the user uses chat through any other surface — inline chat in the editor, terminal chat, GitHub.com chat, agent edits in edit-mode — the boolean flags `used_chat` / `used_agent` are set but the panel-mode counters stay at zero, so `engagement_depth` was `0`.
+
+**The fix:** `engagement_depth` is now sourced from `user_initiated_interaction_count` (= the `total_interactions` column). The docs define this as *"Number of explicit prompts sent to Copilot"* and it explicitly excludes opening chat, switching modes, shortcuts, and passive completions — making it the right cross-surface engagement signal.
+
+**What still uses the panel-only counters:** the `chat_interactions` and `agent_interactions` columns are kept as breakdown columns (useful when populated) and the `Chat-Focused` / `Agent-Heavy` health profiles still use them. For users where panel-mode is always 0 you'll see those classifications less often even though Power User / Healthy / Moderate continue to work correctly.
+
 ### Q: `Seat Assigned Date` and `Last Activity Date` are blank for all users in one or more orgs.
 **A:** The seats endpoint (`/orgs/{org}/copilot/billing/seats`) returned a non-success status. Common causes:
 
@@ -615,7 +624,7 @@ The productivity report uses shortened column names for readability. Here is the
 | `net_loc_change` | `loc_added − loc_deleted` | Derived |
 | `chat_interactions` | Sum of `chat_panel_ask_mode` + `edit_mode` + `plan_mode` + `custom_mode` | Derived (excludes agent mode) |
 | `agent_interactions` | `chat_panel_agent_mode` | Sum across 28 days |
-| `engagement_depth` | `chat_interactions + agent_interactions` | Derived |
+| `engagement_depth` | `Σ user_initiated_interaction_count` (= `total_interactions`); covers active prompts across all Copilot surfaces, not just the chat panel | Derived |
 | `estimated_time_saved_hrs` | `code_acceptances × 5 / 60` | Derived (hours) |
 
 > **Why `_pct`?** Columns ending in `_pct` are calculated **percentages**, not raw API values. They help interpret the data without manual math.
@@ -640,7 +649,7 @@ The generated Excel workbook contains four customer-facing worksheets. Use the s
 active_days              = count(distinct day)
 adoption_rate_pct        = active_days / 28 * 100
 acceptance_rate_pct      = code_acceptance_activity_count / code_generation_activity_count * 100
-engagement_depth         = chat_interactions + agent_interactions
+engagement_depth         = user_initiated_interaction_count  (= total_interactions)
 feature_breadth          = count(used_chat, used_agent, used_cli, code_review flags set to true)
 loc_changed_with_ai      = loc_added_sum + loc_deleted_sum
 copilot_contribution_pct = min(loc_suggested_to_add_sum / loc_added_sum, 1.0) * 100

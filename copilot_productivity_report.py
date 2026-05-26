@@ -672,6 +672,23 @@ def build_user_rows(
         seat = seat_map.get(login, {})
         assigned_date = _parse_iso_date(seat.get("created_at"))
         last_activity_date = _parse_iso_date(seat.get("last_activity_at"))
+
+        # NDJSON-backfill for last_activity_date: when seats are unavailable
+        # (token scope / admin role / 404 etc.) we can still derive the last
+        # activity date from the user's max active day in NDJSON. This won't
+        # help inactive licensed users (they don't appear in NDJSON), but for
+        # active users it means the column is populated and days_inactive is
+        # computable even when the seats API is silently failing.
+        last_activity_source = "seats"
+        if last_activity_date is None:
+            day_set = aggregated.get("active_day_set") or frozenset()
+            if day_set:
+                last_activity_date = max(_parse_iso_date(d) or date.min for d in day_set)
+                if last_activity_date == date.min:
+                    last_activity_date = None
+                else:
+                    last_activity_source = "ndjson"
+
         days_inactive = _compute_days_inactive(last_activity_date, baseline_date)
 
         row: dict[str, Any] = {

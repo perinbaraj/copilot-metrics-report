@@ -553,7 +553,11 @@ That ordering prevents advanced agent users from being incorrectly labeled as we
 - **Admin role:** You must be an **owner / billing manager** of the org. Even with the right scope, a member-role token will get HTTP 403.
 - **No Copilot subscription on the org:** A 404 means the org has no Copilot Business/Enterprise plan.
 
-When this happens the toolkit now prints a `⚠ WARNING: seats fetch returned HTTP ...` line per affected org and a final summary. Re-run with a token that has the right scope and admin role to populate those columns.
+When this happens the toolkit prints a `⚠ WARNING: seats fetch returned HTTP ...` line per affected org and a final summary.
+
+**Backfill behaviour:** Even when seats fail, `Last Activity Date` is now backfilled from the user's **maximum NDJSON day** for users who appear in NDJSON, and `Days Inactive` is recomputed from it. This means active users will still have a populated last-activity column. `Seat Assigned Date` has no NDJSON equivalent and will remain blank until the seats API works.
+
+**Caveat:** Users who are licensed but **inactive** (no NDJSON activity) will be missing from the report entirely when seats are unavailable — so Team Adoption Rate and Needs Enablement counts for those orgs are unreliable. Re-run with a token that has the right scope and admin role to fix this.
 
 ### Q: `chat_interactions` / `agent_interactions` show 0 even though `used_chat: true` / `used_agent: true`.
 **A:** Possible causes:

@@ -636,7 +636,7 @@ The productivity report uses shortened column names for readability. Here is the
 | `active_days` | Count of distinct `day` records per user | Derived |
 | `seat_assigned_date` | `/orgs/{org}/copilot/billing/seats` → `seats[].created_at` | Seat assignment date (`YYYY-MM-DD`) |
 | `last_activity_date` | `/orgs/{org}/copilot/billing/seats` → `seats[].last_activity_at` | Last Copilot editor activity date; empty if never used |
-| `days_inactive` | Derived from `last_activity_at` and `report_end_day` | Days between last activity and the report end date; `"Never"` if `last_activity_at` is null |
+| `days_inactive` | Derived from `last_activity_at` and the current date | Days between the user's last activity and **today** (the day the report was generated); `"Never"` if `last_activity_at` is null. Uses today as the floor so that a user whose latest activity equals `report_end_day` correctly shows `1+` days inactive when the data window ended before today (GitHub's NDJSON is typically 1-2 days behind real-time) |
 | `adoption_rate_pct` | `active_days / 28 × 100` | Derived (%) |
 | `acceptance_rate_pct` | `code_acceptances / code_generations × 100` | Derived (%) |
 | `copilot_contribution_pct` | `min(loc_suggested / loc_added, 1.0) × 100` | Derived (%, capped at 100) |

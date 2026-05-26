@@ -206,11 +206,20 @@ def _safe_filename(name: str) -> str:
 
 
 def _compute_days_inactive(last_activity: date | None, baseline: date | None) -> Any:
-    """Days between baseline (report end) and last activity. 'Never' if no activity."""
+    """Days between today (or baseline, whichever is later) and last activity.
+
+    Uses today's date as the floor so the result reflects calendar reality.
+    GitHub's NDJSON window typically ends 1-2 days behind the current date
+    (data is batch-processed daily), so a user with activity on the last day
+    of the window would otherwise show ``days_inactive = 0`` even though
+    they haven't been active for a real calendar day. Returns ``'Never'``
+    when no activity has ever been recorded.
+    """
     if last_activity is None:
         return "Never"
-    if baseline is None:
-        baseline = datetime.utcnow().date()
+    today = datetime.utcnow().date()
+    if baseline is None or baseline < today:
+        baseline = today
     delta = (baseline - last_activity).days
     return max(delta, 0)
 

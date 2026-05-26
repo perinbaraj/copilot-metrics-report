@@ -92,6 +92,18 @@ ENABLEMENT_COLUMNS = [
     "health_notes",
 ]
 
+LICENSED_USERS_COLUMNS = [
+    "organization",
+    "user_login",
+    "seat_assigned_date",
+    "last_activity_date",
+    "plan_type",
+    "active_days",
+    "total_interactions",
+]
+
+NO_USAGE_PLACEHOLDER = "No usage yet"
+
 HEADER_FILL = PatternFill(fill_type="solid", fgColor="1F4E79")
 HEADER_FONT = Font(bold=True, color="FFFFFF")
 SECTION_FONT = Font(bold=True, color="1F4E79")
@@ -831,6 +843,14 @@ def build_user_rows(
         engagement_depth = total_interactions
 
         seat = seat_map.get(key, {})
+        # `_has_org_seat` is True ONLY when the user holds a real per-org seat
+        # in THIS specific org — not when seat data was backfilled from another
+        # org's seat record via `global_seat_map`. This flag is the source of
+        # truth for "is the user a member of this org?" and drives the
+        # `organizations` column in the Unique Users sheet, so a user licensed
+        # only under org A doesn't show up as "A, B, C, D" just because their
+        # global NDJSON activity appears in B/C/D's per-org dump.
+        has_org_seat = bool(seat)
         seat_source = "per_org" if seat else None
         # Fallback: a licensed user may not have an org-assigned seat in this
         # specific org (e.g. their seat was granted by another org under the
@@ -897,6 +917,8 @@ def build_user_rows(
             "used_code_review": bool(aggregated.get("used_code_review", False)),
             "plan_type": (seat.get("plan_type") or "") if seat else "",
             "_active_day_set": aggregated.get("active_day_set", frozenset()),
+            "_has_org_seat": has_org_seat,
+            "seat_source": seat_source or "",
         }
         row["health_profile"], row["health_notes"] = classify_health(row)
         rows.append(row)
@@ -946,7 +968,23 @@ def dedupe_users_across_orgs(
     )
 
     for login, group in grouped.items():
-        organizations = sorted({row["organization"] for row in group if row.get("organization")})
+        # Build the organizations string from REAL per-org seat membership only.
+        # A user appears in `group` for every org whose NDJSON or seats list
+        # mentioned them, but the user-level NDJSON returns each user's GLOBAL
+        # activity for every org under the enterprise — so a user holding a
+        # seat in only org A will appear in B/C/D's NDJSON too and naively
+        # joining org names would surface as "A, B, C, D". We restrict to rows
+        # where `_has_org_seat` is True (i.e. the user holds a per-org seat in
+        # that org). Fallback: if the user has zero per-org seats anywhere
+        # (Copilot Pro / enterprise-team-only / spillover), fall back to the
+        # NDJSON-orgs set so they're not dropped from the display entirely.
+        seat_orgs = sorted(
+            {row["organization"] for row in group if row.get("organization") and row.get("_has_org_seat")}
+        )
+        if seat_orgs:
+            organizations = seat_orgs
+        else:
+            organizations = sorted({row["organization"] for row in group if row.get("organization")})
 
         merged: dict[str, Any] = {
             "organizations": ", ".join(organizations),
@@ -1172,7 +1210,84 @@ def _write_user_sheet(
             health_cell.fill = style["fill"]
             health_cell.font = style["font"]
 
+    _apply_last_activity_placeholder(ws, header_index)
     _autosize_columns(ws)
+
+
+def _apply_last_activity_placeholder(ws, header_index: dict[str, int]) -> None:
+    """Replace blank `last_activity_date` cells with the `No usage yet` literal.
+
+    When a licensed user has never used Copilot, the seat record's
+    `last_activity_at` is null and we leave the row's `last_activity_date` as
+    an empty string. A blank cell is ambiguous to customers reading the
+    report; the literal `No usage yet` reads cleanly. We strip the
+    `yyyy-mm-dd` number format on those specific cells so the placeholder is
+    preserved as text instead of being coerced into a date display. This
+    runs at write time only — the underlying row dict still has
+    `last_activity_date = ""` so any future sort / export logic keyed on real
+    ISO dates continues to work.
+    """
+    col = header_index.get("last_activity_date")
+    if not col:
+        return
+    for row_idx in range(2, ws.max_row + 1):
+        cell = ws.cell(row=row_idx, column=col)
+        if cell.value in (None, ""):
+            cell.value = NO_USAGE_PLACEHOLDER
+            cell.number_format = "General"
+
+
+def _write_licensed_users_sheet(
+    workbook: Workbook,
+    user_rows: list[dict[str, Any]],
+) -> int:
+    """Write the per-org license inventory sheet.
+
+    Rows are sourced from `user_rows` filtered to entries where
+    `_has_org_seat` is True — i.e. the user holds a real per-org seat in that
+    org (NOT enterprise-spillover backfilled from another org, NOT NDJSON-only
+    presence). This answers the customer's question "who is licensed under
+    org X?" without conflating with enterprise reporting noise.
+
+    The per-org seats API only returns currently-assigned seats, so users
+    whose licenses were revoked simply never appear here — no extra filter
+    needed.
+
+    Returns the total number of license rows written so the caller can
+    surface it in Team Summary.
+    """
+    ws = workbook.create_sheet("Licensed Users by Org")
+    ws.append(LICENSED_USERS_COLUMNS)
+
+    licensed_rows = [row for row in user_rows if row.get("_has_org_seat")]
+    licensed_rows.sort(key=lambda row: (row["organization"], row["user_login"].lower()))
+
+    if not licensed_rows:
+        ws.append(["No live GHCP licenses found in any org"] + [""] * (len(LICENSED_USERS_COLUMNS) - 1))
+        _style_header_row(ws)
+        _autosize_columns(ws)
+        return 0
+
+    for row in licensed_rows:
+        ws.append([row.get(column, "") for column in LICENSED_USERS_COLUMNS])
+
+    _style_header_row(ws)
+
+    header_index = {name: idx + 1 for idx, name in enumerate(LICENSED_USERS_COLUMNS)}
+    number_columns = {"active_days", "total_interactions"}
+    date_columns = {"seat_assigned_date", "last_activity_date"}
+
+    for row_idx in range(2, ws.max_row + 1):
+        for column_name in number_columns:
+            if column_name in header_index:
+                ws.cell(row=row_idx, column=header_index[column_name]).number_format = "#,##0"
+        for column_name in date_columns:
+            if column_name in header_index:
+                ws.cell(row=row_idx, column=header_index[column_name]).number_format = "yyyy-mm-dd"
+
+    _apply_last_activity_placeholder(ws, header_index)
+    _autosize_columns(ws)
+    return len(licensed_rows)
 
 
 def _enablement_sort_key(row: dict[str, Any]) -> tuple[int, str]:
@@ -1226,6 +1341,7 @@ def _write_enablement_sheet(
         login_cell.fill = enablement_fill
         login_cell.font = enablement_font
 
+    _apply_last_activity_placeholder(ws, header_index)
     _autosize_columns(ws)
 
 
@@ -1246,6 +1362,12 @@ def write_excel(output_path: Path, user_rows: list[dict[str, Any]], summary: dic
     )
     _write_user_sheet(workbook, "Unique Users", UNIQUE_USERS_COLUMNS, unique_rows_sorted)
 
+    # Per-org license inventory ("who is licensed under which org?"). Reads the
+    # `_has_org_seat` marker that build_user_rows set so the sheet only counts
+    # live, per-org seat memberships — enterprise-spillover and NDJSON-only
+    # presence are excluded. Returned count feeds Team Summary Overview below.
+    total_live_licenses = _write_licensed_users_sheet(workbook, user_rows)
+
     _write_enablement_sheet(workbook, summary["enablement_rows"])
 
     summary_ws = workbook.create_sheet("Team Summary")
@@ -1254,6 +1376,7 @@ def write_excel(output_path: Path, user_rows: list[dict[str, Any]], summary: dic
         ("Total User-Org Rows", summary["total_users"], "number"),
         ("Unique Users", summary["unique_user_count"], "number"),
         ("Unique Active Users", summary["unique_active_user_count"], "number"),
+        ("Total Live Licensed Users", total_live_licenses, "number"),
         ("Team Adoption Rate", summary["team_adoption_rate_pct"], "pct"),
         ("Report Period", summary["report_period"], "label"),
         ("", "", "blank"),
@@ -1595,11 +1718,28 @@ def main() -> None:
         report_end=overall_report_end,
         metrics_are_global=True,
     )
+
+    # Per customer feedback: users with no current GHCP seat (revoked / never
+    # licensed) should not clutter the Unique Users sheet or skew Team Summary
+    # KPIs — "unlicensed = not our user". We filter the deduped list here so
+    # every downstream consumer (Unique Users sheet, Team Summary totals,
+    # Needs Enablement, top 10, health distribution, feature adoption) sees
+    # the same licensed-only pool. The per-org User Productivity sheet keeps
+    # every row so the raw, traceable view is preserved.
+    licensed_unique_rows = [row for row in unique_rows if row.get("seat_assigned_date")]
+    unlicensed_count = len(unique_rows) - len(licensed_unique_rows)
+    if unlicensed_count:
+        print(
+            f"\nℹ Excluded {unlicensed_count} user(s) from Unique Users / Team Summary "
+            f"because they have no current GHCP seat (license revoked or never assigned). "
+            f"Their per-org activity rows remain in the User Productivity sheet."
+        )
+
     summary = build_team_summary(
         all_user_rows,
         min(report_starts) if report_starts else "",
         overall_report_end,
-        unique_rows=unique_rows,
+        unique_rows=licensed_unique_rows,
     )
 
     failed_orgs = [org for org, status in seat_status.items() if status != "ok"]

@@ -566,6 +566,20 @@ days_inactive = REPORT_DAYS − active_days   (clamped to ≥ 0)
 
 So a user with `active_days = 3` over the 28-day window shows `days_inactive = 25`. This is the productivity-report-aligned metric — it counts days the user did **not actively prompt Copilot via NDJSON**, which is the signal you actually want for adoption / coaching conversations. `last_activity_date` (the seat's most recent timestamp) is still surfaced separately so you can see "are they at least loading the extension."
 
+### Q: A user shows up in 4 orgs in **User Productivity** but only 1 in **Unique Users**. Which is correct?
+**A:** Both are. They answer different questions:
+
+- **User Productivity** is the raw per-org view. Because the user-level NDJSON returns each user's **global** Copilot activity for every org they hold a seat in under the enterprise (see §2.2), a user licensed only under org A will still appear in B/C/D's NDJSON if they're a member of those orgs. The sheet keeps every (org, user) row so you can audit where their activity surfaced.
+- **Unique Users** is the deduped per-person view. The `organizations` column lists only orgs where the user holds a **real per-org seat** — not orgs whose NDJSON merely included their cross-enterprise activity. So a user with a single seat in org A correctly shows `organizations = "A"` here, even though they appear in B/C/D's per-org dump.
+
+If you want the per-org **license** view (seats only, no NDJSON noise), use the new **Licensed Users by Org** sheet.
+
+### Q: `last_activity_date` reads `No usage yet` for some users. What does that mean?
+**A:** The user has a current GHCP seat (so they show up in **Licensed Users by Org** and **Unique Users**) but has never used Copilot in a way that updated the seat's `last_activity_at` timestamp — typically a newly assigned license that hasn't been opened yet. This is a **display-time substitution** for an empty cell; the underlying value is still an empty string so future filters / exports keyed on real ISO dates continue to work. It's a coaching signal: those users are paying for a license they aren't using.
+
+### Q: Users with a blank `seat_assigned_date` used to appear in **Unique Users** and **Team Summary**. Now they don't. Why?
+**A:** Per customer feedback, users with no current GHCP seat (license revoked or never assigned) are now excluded from **Unique Users**, **Team Summary**, **Needs Enablement**, top 10, and health distribution. The rule is "unlicensed = not our user" — those rows skewed adoption numbers and confused customer conversations. They remain visible in the per-org **User Productivity** sheet so the raw view is still traceable. The script prints a `ℹ Excluded N user(s)…` line on each run when this happens.
+
 ### Q: The script prints `Seats: 0 (status: ok)` for every org but NDJSON activity is present. What's wrong?
 **A:** Nothing on the API side. `status: ok` means the seats endpoint returned **HTTP 200 with an empty list**, not an error. Three things can produce this:
 
@@ -646,7 +660,7 @@ The productivity report uses shortened column names for readability. Here is the
 | `loc_deleted` | `loc_deleted_sum` | Sum across 28 days |
 | `active_days` | Count of distinct `day` records per user | Derived |
 | `seat_assigned_date` | `/orgs/{org}/copilot/billing/seats` → `seats[].created_at` | Seat assignment date (`YYYY-MM-DD`) |
-| `last_activity_date` | `/orgs/{org}/copilot/billing/seats` → `seats[].last_activity_at` | Last Copilot editor activity date; empty if never used |
+| `last_activity_date` | `/orgs/{org}/copilot/billing/seats` → `seats[].last_activity_at` | Last Copilot editor activity date. Displayed as `No usage yet` when the licensed user has never used Copilot. NDJSON-backfilled to the user's max active day when the seats endpoint is silently unavailable. |
 | `days_inactive` | `REPORT_DAYS − active_days` (clamped to ≥ 0) | **Days within the 28-day reporting window where the user did NOT have NDJSON-recorded Copilot prompts.** A user with `active_days = 3` shows `days_inactive = 25`. This replaces an earlier "calendar days since last use" definition, which was misleading because `seat.last_activity_at` updates on passive IDE telemetry (extension loaded) and would always show `0` for anyone with an editor open. If you need the raw last-seen timestamp it's still surfaced as `last_activity_date`. |
 | `adoption_rate_pct` | `active_days / 28 × 100` | Derived (%) |
 | `acceptance_rate_pct` | `code_acceptances / code_generations × 100` | Derived (%) |
@@ -661,17 +675,18 @@ The productivity report uses shortened column names for readability. Here is the
 
 ### Workbook sheet reference
 
-The generated Excel workbook contains four customer-facing worksheets. Use the sheet that matches the level of analysis needed:
+The generated Excel workbook contains five customer-facing worksheets. Use the sheet that matches the level of analysis needed:
 
 | Worksheet | What it contains | Best use | Key notes |
 |---|---|---|---|
-| **User Productivity** | One row per user per organization, including the new `seat_assigned_date`, `last_activity_date`, and `days_inactive` columns | Per-org analysis, org-specific follow-up, and validating how a user appears within each organization | A user who belongs to two organizations appears as two rows |
-| **Unique Users** | One row per distinct `user_login` across all organizations; `organization` is renamed to `organizations` and contains a comma-separated list when needed | Customer-wide adoption and ROI conversations where users should not be double-counted | Volumetric metrics are summed; `active_days` uses the max across orgs capped at 28; rates are recomputed from merged totals; `seat_assigned_date` is earliest, `last_activity_date` is latest; health profile is reclassified; sorted by `engagement_depth` descending |
-| **Needs Enablement** | Users from the deduped list where `health_profile == "Needs Enablement"`, including `user_login`, `organizations`, date/inactivity fields, activity counts, and `health_notes` | Coaching, training, and license-adoption follow-up | Sorted by `days_inactive` descending: users with zero activity in the 28-day window (`days_inactive = 28`) appear first; if empty, the sheet shows `No users currently flagged for enablement` |
-| **Team Summary** | Rollup KPIs, health distribution, top engaged users, and enablement counts | Executive summary and customer readout | Overview includes `Unique Users` and `Unique Active Users`; health distribution uses the deduped unique-user list; top users by engagement depth shows the top 10 unique users and excludes zero-engagement users; enablement detail is shown in the **Needs Enablement** sheet |
+| **User Productivity** | One row per user per organization, including the new `seat_assigned_date`, `last_activity_date`, and `days_inactive` columns | Per-org analysis, org-specific follow-up, and validating how a user appears within each organization | A user who belongs to two organizations appears as two rows. This is the raw, unfiltered view — users with no current GHCP seat (NDJSON-only / Copilot Pro) are kept here for traceability |
+| **Unique Users** | One row per distinct `user_login` across all organizations; `organization` is renamed to `organizations` and lists only orgs where the user holds a **real per-org seat** (not just NDJSON activity from enterprise-wide reporting) | Customer-wide adoption and ROI conversations where users should not be double-counted | Users with no current GHCP seat (`seat_assigned_date` blank) are **excluded** — "unlicensed = not our user". Volumetric metrics are summed; `active_days` uses the max across orgs capped at 28; rates are recomputed from merged totals; `seat_assigned_date` is earliest, `last_activity_date` is latest; health profile is reclassified; sorted by `engagement_depth` descending. `last_activity_date` reads `No usage yet` for licensed users who never used Copilot |
+| **Licensed Users by Org** | One row per `(organization, user_login)` pair where the user holds a current per-org seat — answers "who is licensed under org X?" | License inventory, seat reconciliation, per-org adoption conversations | Source is the live per-org seats API — revoked / removed seats simply don't appear, so this is always a current view. Enterprise-spillover seats (granted by another org under the same enterprise) and NDJSON-only presence are excluded so the count matches GitHub's own seat-management page. `last_activity_date` reads `No usage yet` for licensed users with no Copilot activity in the window |
+| **Needs Enablement** | Users from the licensed deduped list where `health_profile == "Needs Enablement"`, including `user_login`, `organizations`, date/inactivity fields, activity counts, and `health_notes` | Coaching, training, and license-adoption follow-up | Inherits the Unique Users licensed-only filter (no unlicensed users appear here). Sorted by `days_inactive` descending: users with zero activity in the 28-day window (`days_inactive = 28`) appear first; if empty, the sheet shows `No users currently flagged for enablement` |
+| **Team Summary** | Rollup KPIs, health distribution, top engaged users, and enablement counts | Executive summary and customer readout | Overview includes `Unique Users`, `Unique Active Users`, and **`Total Live Licensed Users`** (= sum of per-org seat counts; counts each seat assignment, so a user licensed under two orgs counts twice). All KPIs are computed from the licensed-only deduped pool; health distribution uses the licensed-only unique-user list; top users by engagement depth shows the top 10 unique users and excludes zero-engagement users |
 
 > [!NOTE]
-> In **Team Summary**, `Unique Users` means distinct `user_login`, and `Unique Active Users` means distinct `user_login` with `active_days > 0`. The previous inline enablement list is intentionally replaced by a count and a pointer to the **Needs Enablement** worksheet.
+> In **Team Summary**, `Unique Users` means distinct licensed `user_login`, `Unique Active Users` means distinct licensed `user_login` with `active_days > 0`, and `Total Live Licensed Users` is the sum of per-org seats (so a user licensed under two orgs adds 2). The previous inline enablement list is intentionally replaced by a count and a pointer to the **Needs Enablement** worksheet.
 
 ### Step 2 — Derive user-level KPIs
 

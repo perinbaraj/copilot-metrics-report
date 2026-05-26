@@ -54,7 +54,6 @@ USER_PRODUCTIVITY_COLUMNS = [
     "seat_assigned_date",
     "last_activity_date",
     "days_inactive",
-    "inactive_days_in_window",
     "active_days",
     "adoption_rate_pct",
     "total_interactions",
@@ -86,7 +85,6 @@ ENABLEMENT_COLUMNS = [
     "seat_assigned_date",
     "last_activity_date",
     "days_inactive",
-    "inactive_days_in_window",
     "active_days",
     "total_interactions",
     "code_generations",
@@ -207,23 +205,16 @@ def _safe_filename(name: str) -> str:
     return safe[:80] or "unknown"
 
 
-def _compute_days_inactive(last_activity: date | None, baseline: date | None) -> Any:
-    """Days between today (or baseline, whichever is later) and last activity.
+def _window_days_inactive(active_days: int) -> int:
+    """Days within the REPORT_DAYS window the user did NOT prompt Copilot.
 
-    Uses today's date as the floor so the result reflects calendar reality.
-    GitHub's NDJSON window typically ends 1-2 days behind the current date
-    (data is batch-processed daily), so a user with activity on the last day
-    of the window would otherwise show ``days_inactive = 0`` even though
-    they haven't been active for a real calendar day. Returns ``'Never'``
-    when no activity has ever been recorded.
+    Simple, unambiguous productivity metric: 28 minus the user's NDJSON
+    active-day count, clamped to [0, REPORT_DAYS]. A user with no NDJSON
+    activity gets 28; a user active every day gets 0. Unlike a calendar-
+    based 'days since last use', this does not get reset to 0 by passive
+    IDE telemetry, so it remains a reliable signal for adoption coaching.
     """
-    if last_activity is None:
-        return "Never"
-    today = datetime.utcnow().date()
-    if baseline is None or baseline < today:
-        baseline = today
-    delta = (baseline - last_activity).days
-    return max(delta, 0)
+    return max(0, min(REPORT_DAYS, REPORT_DAYS - int(active_days or 0)))
 
 
 def validate_token(token: str) -> None:
@@ -793,7 +784,6 @@ def build_user_rows(
                 f"GitHub may have renamed it. Inspect the saved debug_seats_*.json."
             )
 
-    baseline_date = _parse_iso_date(report_end) or datetime.utcnow().date()
     if global_aggregation is not None:
         ndjson_agg = global_aggregation
         org_logins = {
@@ -861,8 +851,8 @@ def build_user_rows(
         # (token scope / admin role / 404 etc.) we can still derive the last
         # activity date from the user's max active day in NDJSON. This won't
         # help inactive licensed users (they don't appear in NDJSON), but for
-        # active users it means the column is populated and days_inactive is
-        # computable even when the seats API is silently failing.
+        # active users it means the column is still populated even when the
+        # seats API is silently failing.
         last_activity_source = "seats"
         if last_activity_date is None:
             day_set = aggregated.get("active_day_set") or frozenset()
@@ -873,7 +863,11 @@ def build_user_rows(
                 else:
                     last_activity_source = "ndjson"
 
-        days_inactive = _compute_days_inactive(last_activity_date, baseline_date)
+        # days_inactive = days in the 28-day reporting window the user did NOT
+        # prompt Copilot via NDJSON. Window-bounded so it's never reset to 0
+        # by passive IDE telemetry (seat.last_activity_at) — gives a stable,
+        # adoption-aligned signal for coaching conversations.
+        days_inactive = _window_days_inactive(active_days)
 
         row: dict[str, Any] = {
             "organization": org,
@@ -881,7 +875,6 @@ def build_user_rows(
             "seat_assigned_date": _format_iso_date(assigned_date),
             "last_activity_date": _format_iso_date(last_activity_date),
             "days_inactive": days_inactive,
-            "inactive_days_in_window": max(REPORT_DAYS - active_days, 0),
             "active_days": active_days,
             "adoption_rate_pct": round(active_days / REPORT_DAYS * 100, 1),
             "total_interactions": total_interactions,
@@ -920,8 +913,9 @@ def dedupe_users_across_orgs(
     """Collapse per-org rows into one row per user_login.
 
     organizations is a comma-separated, sorted list. Seat dates use earliest
-    assigned and latest activity; days_inactive is recomputed against the
-    shared baseline (report_end). Health is reclassified on the merged numbers.
+    assigned and latest activity. `days_inactive` is recomputed from the
+    merged `active_days` as ``REPORT_DAYS - active_days``. Health is
+    reclassified on the merged numbers.
 
     When ``metrics_are_global=True`` (the live `main()` path), each per-org row
     already contains the user's GLOBAL Copilot metrics (because the user-level
@@ -930,12 +924,14 @@ def dedupe_users_across_orgs(
     by the number of orgs the user is in. Otherwise (mock / legacy / truly
     org-scoped data) volume metrics are summed and `active_days` uses the
     union of distinct days across orgs (capped at 28).
+
+    The ``report_end`` parameter is retained for backwards compatibility but
+    is no longer used (days_inactive is now derived from active_days).
     """
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in user_rows:
         grouped[row["user_login"]].append(row)
 
-    baseline_date = _parse_iso_date(report_end) or datetime.utcnow().date()
     merged_rows: list[dict[str, Any]] = []
 
     sum_fields = (
@@ -974,7 +970,6 @@ def dedupe_users_across_orgs(
             )
 
         merged["adoption_rate_pct"] = round(merged["active_days"] / REPORT_DAYS * 100, 1)
-        merged["inactive_days_in_window"] = max(REPORT_DAYS - merged["active_days"], 0)
         merged["acceptance_rate_pct"] = _safe_pct(merged["code_acceptances"], merged["code_generations"])
         merged["net_loc_change"] = merged["loc_added"] - merged["loc_deleted"]
         merged["copilot_contribution_pct"] = _safe_pct(merged["loc_suggested"], merged["loc_added"], cap=100.0)
@@ -993,9 +988,7 @@ def dedupe_users_across_orgs(
         activity_dates = [d for d in (_parse_iso_date(row.get("last_activity_date")) for row in group) if d]
         merged["seat_assigned_date"] = _format_iso_date(min(assigned_dates)) if assigned_dates else ""
         merged["last_activity_date"] = _format_iso_date(max(activity_dates)) if activity_dates else ""
-        merged["days_inactive"] = _compute_days_inactive(
-            max(activity_dates) if activity_dates else None, baseline_date
-        )
+        merged["days_inactive"] = _window_days_inactive(merged["active_days"])
 
         plan_types = sorted({row.get("plan_type") for row in group if row.get("plan_type")})
         merged["plan_type"] = ", ".join(plan_types)
@@ -1171,8 +1164,7 @@ def _write_user_sheet(
                 ws.cell(row=row_idx, column=header_index[column_name]).number_format = "yyyy-mm-dd"
         if days_inactive_column in header_index:
             cell = ws.cell(row=row_idx, column=header_index[days_inactive_column])
-            if isinstance(cell.value, (int, float)):
-                cell.number_format = "#,##0"
+            cell.number_format = "#,##0"
 
         if health_col:
             health_cell = ws.cell(row=row_idx, column=health_col)
@@ -1183,12 +1175,14 @@ def _write_user_sheet(
     _autosize_columns(ws)
 
 
-def _enablement_sort_key(row: dict[str, Any]) -> tuple[int, int, str]:
-    """Sort key for Needs Enablement: 'Never' first, then largest days_inactive."""
-    days = row.get("days_inactive")
-    if isinstance(days, str):  # 'Never'
-        return (0, 0, row["user_login"].lower())
-    return (1, -int(days or 0), row["user_login"].lower())
+def _enablement_sort_key(row: dict[str, Any]) -> tuple[int, str]:
+    """Sort key for Needs Enablement: largest days_inactive first, then by login.
+
+    days_inactive is always a non-negative integer (REPORT_DAYS - active_days,
+    clamped at 0), so no string handling is needed.
+    """
+    days = int(row.get("days_inactive") or 0)
+    return (-days, row["user_login"].lower())
 
 
 def _write_enablement_sheet(
@@ -1226,8 +1220,7 @@ def _write_enablement_sheet(
             if column_name in header_index:
                 ws.cell(row=row_idx, column=header_index[column_name]).number_format = "yyyy-mm-dd"
         days_cell = ws.cell(row=row_idx, column=header_index["days_inactive"])
-        if isinstance(days_cell.value, (int, float)):
-            days_cell.number_format = "#,##0"
+        days_cell.number_format = "#,##0"
 
         login_cell = ws.cell(row=row_idx, column=login_col)
         login_cell.fill = enablement_fill

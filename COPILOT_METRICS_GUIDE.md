@@ -555,15 +555,16 @@ That ordering prevents advanced agent users from being incorrectly labeled as we
 
 **What still uses the panel-only counters:** the `chat_interactions` and `agent_interactions` columns are kept as breakdown columns (useful when populated) and the `Chat-Focused` / `Agent-Heavy` health profiles still use them. For users where panel-mode is always 0 you'll see those classifications less often even though Power User / Healthy / Moderate continue to work correctly.
 
-### Q: `days_inactive` shows `0` for an active user even though their NDJSON activity was days ago. Is that wrong?
-**A:** No — but it's measuring something subtle. There are **two** distinct "inactive" metrics in the report and they answer different questions:
+### Q: `days_inactive` shows `0` for an active user even though their seat's `last_activity_at` was today. Is that wrong?
+**A:** No. `days_inactive` in this report is **NOT** "calendar days since last use" — that field was misleading, because `seat.last_activity_at` is a real-time signal that updates the moment a user opens an IDE with the Copilot extension loaded (passive presence counts). That made the column always show `0` for anyone with an IDE open, regardless of whether they actually prompted Copilot.
 
-| Column | What it measures | Source | Useful for |
-|---|---|---|---|
-| `days_inactive` | **Calendar days since the user's last Copilot use.** `0` = active today, `7` = last used a week ago, `"Never"` = seat never activated. | `seat.last_activity_at` (or NDJSON max-day fallback) compared to today. | "Is this user still actively using Copilot at all?" |
-| `inactive_days_in_window` | **Days in the 28-day reporting window where the user did NOT prompt Copilot via NDJSON.** | `28 − active_days`. | "Of the last 28 days, how many did this user not actively prompt Copilot?" — the productivity-report-aligned metric. |
+Instead, `days_inactive` is now defined as:
 
-**Why both?** `seat.last_activity_at` is a real-time field that updates the moment a user opens an IDE with the Copilot extension loaded — even passive presence counts. So a user who opens their IDE today but only *actually prompts* Copilot 3 times out of 28 days will show `days_inactive = 0` and `inactive_days_in_window = 25`. The first one says "they have Copilot loaded today," the second says "they're rarely using it during the reporting window." Both are valid; the second is usually the one you want to highlight to customers for adoption / coaching conversations.
+```
+days_inactive = REPORT_DAYS − active_days   (clamped to ≥ 0)
+```
+
+So a user with `active_days = 3` over the 28-day window shows `days_inactive = 25`. This is the productivity-report-aligned metric — it counts days the user did **not actively prompt Copilot via NDJSON**, which is the signal you actually want for adoption / coaching conversations. `last_activity_date` (the seat's most recent timestamp) is still surfaced separately so you can see "are they at least loading the extension."
 
 ### Q: The script prints `Seats: 0 (status: ok)` for every org but NDJSON activity is present. What's wrong?
 **A:** Nothing on the API side. `status: ok` means the seats endpoint returned **HTTP 200 with an empty list**, not an error. Three things can produce this:
@@ -646,8 +647,7 @@ The productivity report uses shortened column names for readability. Here is the
 | `active_days` | Count of distinct `day` records per user | Derived |
 | `seat_assigned_date` | `/orgs/{org}/copilot/billing/seats` → `seats[].created_at` | Seat assignment date (`YYYY-MM-DD`) |
 | `last_activity_date` | `/orgs/{org}/copilot/billing/seats` → `seats[].last_activity_at` | Last Copilot editor activity date; empty if never used |
-| `days_inactive` | Derived from `last_activity_at` and the current date | **Calendar days since the user's last Copilot use.** `0` means they used Copilot today. `"Never"` if the seat has never been activated. Uses today as the floor so the result reflects calendar reality (GitHub's NDJSON is typically 1-2 days behind real-time). **Note:** `last_activity_at` from the seats endpoint reflects real-time IDE telemetry — it can be more recent than the NDJSON window end, and updates the moment the user opens an IDE with Copilot. If you want "how many days in the 28-day window did this user not actively prompt Copilot," use **`inactive_days_in_window`** instead. |
-| `inactive_days_in_window` | `REPORT_DAYS − active_days` (clamped to ≥ 0) | **Days within the 28-day reporting window where the user did NOT have NDJSON-recorded Copilot prompts.** This is the productivity-report-aligned metric: a user with `active_days = 3` shows `inactive_days_in_window = 25`. Useful for spotting low-usage licensed users even when `days_inactive` is 0 (i.e. the seat is "active" via IDE telemetry but the user rarely prompts Copilot). |
+| `days_inactive` | `REPORT_DAYS − active_days` (clamped to ≥ 0) | **Days within the 28-day reporting window where the user did NOT have NDJSON-recorded Copilot prompts.** A user with `active_days = 3` shows `days_inactive = 25`. This replaces an earlier "calendar days since last use" definition, which was misleading because `seat.last_activity_at` updates on passive IDE telemetry (extension loaded) and would always show `0` for anyone with an editor open. If you need the raw last-seen timestamp it's still surfaced as `last_activity_date`. |
 | `adoption_rate_pct` | `active_days / 28 × 100` | Derived (%) |
 | `acceptance_rate_pct` | `code_acceptances / code_generations × 100` | Derived (%) |
 | `copilot_contribution_pct` | `min(loc_suggested / loc_added, 1.0) × 100` | Derived (%, capped at 100) |
@@ -667,7 +667,7 @@ The generated Excel workbook contains four customer-facing worksheets. Use the s
 |---|---|---|---|
 | **User Productivity** | One row per user per organization, including the new `seat_assigned_date`, `last_activity_date`, and `days_inactive` columns | Per-org analysis, org-specific follow-up, and validating how a user appears within each organization | A user who belongs to two organizations appears as two rows |
 | **Unique Users** | One row per distinct `user_login` across all organizations; `organization` is renamed to `organizations` and contains a comma-separated list when needed | Customer-wide adoption and ROI conversations where users should not be double-counted | Volumetric metrics are summed; `active_days` uses the max across orgs capped at 28; rates are recomputed from merged totals; `seat_assigned_date` is earliest, `last_activity_date` is latest; health profile is reclassified; sorted by `engagement_depth` descending |
-| **Needs Enablement** | Users from the deduped list where `health_profile == "Needs Enablement"`, including `user_login`, `organizations`, date/inactivity fields, activity counts, and `health_notes` | Coaching, training, and license-adoption follow-up | Sorted by `days_inactive` descending: users who have never used Copilot appear first, followed by the most stale users; if empty, the sheet shows `No users currently flagged for enablement` |
+| **Needs Enablement** | Users from the deduped list where `health_profile == "Needs Enablement"`, including `user_login`, `organizations`, date/inactivity fields, activity counts, and `health_notes` | Coaching, training, and license-adoption follow-up | Sorted by `days_inactive` descending: users with zero activity in the 28-day window (`days_inactive = 28`) appear first; if empty, the sheet shows `No users currently flagged for enablement` |
 | **Team Summary** | Rollup KPIs, health distribution, top engaged users, and enablement counts | Executive summary and customer readout | Overview includes `Unique Users` and `Unique Active Users`; health distribution uses the deduped unique-user list; top users by engagement depth shows the top 10 unique users and excludes zero-engagement users; enablement detail is shown in the **Needs Enablement** sheet |
 
 > [!NOTE]

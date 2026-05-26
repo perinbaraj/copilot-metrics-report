@@ -135,6 +135,15 @@ Each downloaded file is newline-delimited JSON:
 > [!TIP]
 > Treat each NDJSON line as an independent record. Do **not** try to load the whole file as one JSON array.
 
+> [!WARNING]
+> **User-level NDJSON returns each user's GLOBAL Copilot activity for every org they hold a seat in — not org-scoped activity.**
+>
+> If a developer is a member of 4 orgs, calling the endpoint on all 4 orgs will return 4 sets of records with **identical** numbers per `(user_login, day)` — once per org. The activity is the user's total across all surfaces (VS Code, JetBrains, GitHub.com, CLI, etc.), regardless of which org you queried.
+>
+> **Implication:** Naïvely summing counts across orgs multiplies every total by the number of orgs each user belongs to. This toolkit dedupes by `(user_login, day)` before aggregation so Team Summary and Unique Users sheets show correct totals. Per-org rows in **User Productivity** still appear (so you can see which orgs each user is enrolled in), but the metrics shown are the user's global numbers — that's why the same user has identical numbers across orgs.
+>
+> If you build your own aggregation pipeline, deduplicate on `(user_login, day)` first.
+
 ---
 
 ## 3. NDJSON Metrics Reference — Complete Field Guide
@@ -533,6 +542,40 @@ That ordering prevents advanced agent users from being incorrectly labeled as we
 
 ### Q: Why do team totals sometimes not match organization totals?
 **A:** Team-level metrics require joining user activity to daily team snapshots. Multi-team users can contribute to more than one team, and teams with fewer than five seated users are omitted from user-teams reports.
+
+### Q: My report shows the same user listed under multiple orgs with **identical** numbers. Is the data wrong?
+**A:** No — that's expected. The user-level NDJSON returns each user's **global** Copilot activity for every org they hold a seat in (see the warning in §2.2). The toolkit dedupes by `(user_login, day)` before computing the Team Summary and Unique Users sheet, so totals are accurate. Per-org rows are kept so you can see which orgs each user is enrolled in; treat them as membership rows, not independent activity rows.
+
+### Q: `Seat Assigned Date` and `Last Activity Date` are blank for all users in one or more orgs.
+**A:** The seats endpoint (`/orgs/{org}/copilot/billing/seats`) returned a non-success status. Common causes:
+
+- **Token scope:** Personal access tokens need `manage_billing:copilot` (classic) or the equivalent fine-grained `Copilot Business → Read` permission.
+- **Admin role:** You must be an **owner / billing manager** of the org. Even with the right scope, a member-role token will get HTTP 403.
+- **No Copilot subscription on the org:** A 404 means the org has no Copilot Business/Enterprise plan.
+
+When this happens the toolkit now prints a `⚠ WARNING: seats fetch returned HTTP ...` line per affected org and a final summary. Re-run with a token that has the right scope and admin role to populate those columns.
+
+### Q: `chat_interactions` / `agent_interactions` show 0 even though `used_chat: true` / `used_agent: true`.
+**A:** Possible causes:
+
+1. **Field-name mismatch** — GitHub occasionally renames or restructures NDJSON fields. Run with `--debug` and inspect the printed `first record top-level keys` to confirm the field names match what the script expects (`chat_panel_ask_mode`, `chat_panel_edit_mode`, `chat_panel_plan_mode`, `chat_panel_custom_mode`, `chat_panel_agent_mode`).
+2. **Chat used only via surfaces that don't populate panel-mode counters** — for example, inline chat suggestions in some IDEs may set `used_chat: true` without incrementing the panel-mode counts.
+3. **Window has no chat days** — `used_chat: true` is sticky across the window; the counter may still be zero on the specific days returned.
+
+### Q: How do I capture the raw API payloads for debugging?
+**A:** Run the report with `--debug`:
+
+```
+python copilot_productivity_report.py --orgs my-org --debug
+```
+
+For each org the script will:
+
+- Save the raw NDJSON download to `./debug_<org>_<timestamp>.ndjson`
+- Save the raw seats JSON to `./debug_seats_<org>_<timestamp>.json`
+- Print the first NDJSON record's top-level keys and any chat/agent-related fields
+
+These files contain user-identifying data and are already in `.gitignore` (`debug_*.ndjson`, `debug_*.json`); delete them after you're done diagnosing.
 
 ---
 

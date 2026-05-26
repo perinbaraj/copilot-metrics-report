@@ -199,6 +199,12 @@ def _format_iso_date(value: date | None) -> str:
     return value.isoformat() if value else ""
 
 
+def _safe_filename(name: str) -> str:
+    """Sanitize a string for safe use in a filename."""
+    safe = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in (name or ""))
+    return safe[:80] or "unknown"
+
+
 def _compute_days_inactive(last_activity: date | None, baseline: date | None) -> Any:
     """Days between baseline (report end) and last activity. 'Never' if no activity."""
     if last_activity is None:
@@ -264,24 +270,64 @@ def discover_orgs(token: str, enterprise: str) -> list[str]:
     return orgs
 
 
-def fetch_seats(token: str, org: str) -> list[dict]:
-    """Fetch Copilot seat assignments for an org."""
+def fetch_seats(token: str, org: str, debug: bool = False) -> tuple[list[dict], str]:
+    """Fetch Copilot seat assignments for an org.
+
+    Returns (seats, status) where status is one of:
+      - 'ok'             : seats successfully retrieved (may be empty if org has none)
+      - 'forbidden'      : 403 — token lacks scope or user lacks admin permission
+      - 'not_found'      : 404 — org has no Copilot subscription or endpoint not enabled
+      - 'http_<code>'    : other HTTP error
+      - 'error'          : transport / parse error
+    """
     seats: list[dict] = []
     page = 1
+    last_status = "ok"
+    raw_pages: list[dict] = []
     with httpx.Client(timeout=30) as client:
         while True:
-            resp = client.get(
-                f"{GITHUB_API_BASE}/orgs/{org}/copilot/billing/seats",
-                headers=_headers(token),
-                params={"page": page, "per_page": MAX_PER_PAGE},
-            )
+            try:
+                resp = client.get(
+                    f"{GITHUB_API_BASE}/orgs/{org}/copilot/billing/seats",
+                    headers=_headers(token),
+                    params={"page": page, "per_page": MAX_PER_PAGE},
+                )
+            except (httpx.ConnectError, httpx.TimeoutException) as exc:
+                print(f"   ⚠ Network error fetching seats for {org}: {exc}")
+                return seats, "error"
+
             if resp.status_code in (403, 429) and _handle_rate_limit(resp):
                 continue
             if resp.status_code != 200:
-                if resp.status_code in (403, 404):
-                    _try_print_response(resp)
+                if resp.status_code == 403:
+                    last_status = "forbidden"
+                    print(
+                        f"   ⚠ WARNING: seats fetch returned HTTP 403 for org '{org}'. "
+                        f"Token likely lacks 'manage_billing:copilot' scope OR you are not an admin of this org. "
+                        f"Seat dates (assigned/last-used) will be blank for users in this org."
+                    )
+                elif resp.status_code == 404:
+                    last_status = "not_found"
+                    print(
+                        f"   ⚠ WARNING: seats endpoint returned HTTP 404 for org '{org}'. "
+                        f"Org may not have a Copilot Business/Enterprise subscription. "
+                        f"Seat dates will be blank for users in this org."
+                    )
+                else:
+                    last_status = f"http_{resp.status_code}"
+                    print(
+                        f"   ⚠ WARNING: seats fetch returned HTTP {resp.status_code} for org '{org}'. "
+                        f"Seat dates will be blank for users in this org."
+                    )
+                _try_print_response(resp)
                 break
-            data = resp.json()
+            try:
+                data = resp.json()
+            except json.JSONDecodeError:
+                last_status = "error"
+                print(f"   ⚠ WARNING: seats response for org '{org}' was not valid JSON.")
+                break
+            raw_pages.append(data)
             page_seats = data.get("seats", [])
             if not page_seats:
                 break
@@ -289,14 +335,34 @@ def fetch_seats(token: str, org: str) -> list[dict]:
             if len(seats) >= data.get("total_seats", len(seats)):
                 break
             page += 1
-    return seats
+
+    if debug and (raw_pages or last_status != "ok"):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        debug_path = Path(f"debug_seats_{_safe_filename(org)}_{ts}.json")
+        try:
+            debug_path.write_text(
+                json.dumps({"status": last_status, "pages": raw_pages}, indent=2),
+                encoding="utf-8",
+            )
+            print(f"   🐛 [debug] saved raw seats payload → {debug_path}")
+            if seats:
+                first_keys = sorted(seats[0].keys())
+                print(f"   🐛 [debug] first seat top-level keys: {first_keys}")
+                assignee = seats[0].get("assignee") or {}
+                if isinstance(assignee, dict):
+                    print(f"   🐛 [debug] first seat assignee keys: {sorted(assignee.keys())}")
+        except OSError as exc:
+            print(f"   ⚠ Could not write debug seats payload: {exc}")
+
+    return seats, last_status
 
 
-def fetch_ndjson(token: str, org: str) -> tuple[list[dict], str, str]:
+def fetch_ndjson(token: str, org: str, debug: bool = False) -> tuple[list[dict], str, str]:
     """Fetch per-user NDJSON usage metrics and report period metadata."""
     records: list[dict] = []
     report_start = ""
     report_end = ""
+    raw_text_chunks: list[str] = []
     with httpx.Client(timeout=60) as client:
         while True:
             resp = client.get(
@@ -306,6 +372,11 @@ def fetch_ndjson(token: str, org: str) -> tuple[list[dict], str, str]:
             if resp.status_code in (403, 429) and _handle_rate_limit(resp):
                 continue
             if resp.status_code != 200:
+                if debug:
+                    print(
+                        f"   🐛 [debug] NDJSON manifest fetch for {org} returned HTTP {resp.status_code}"
+                    )
+                    _try_print_response(resp)
                 return [], report_start, report_end
             break
 
@@ -336,6 +407,8 @@ def fetch_ndjson(token: str, org: str) -> tuple[list[dict], str, str]:
                 continue
             if dl.status_code != 200:
                 continue
+            if debug:
+                raw_text_chunks.append(dl.text)
             for line in dl.text.strip().splitlines():
                 line = line.strip()
                 if not line:
@@ -344,7 +417,98 @@ def fetch_ndjson(token: str, org: str) -> tuple[list[dict], str, str]:
                     records.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
+
+    if debug:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if raw_text_chunks:
+            debug_path = Path(f"debug_{_safe_filename(org)}_{ts}.ndjson")
+            try:
+                debug_path.write_text("\n".join(raw_text_chunks), encoding="utf-8")
+                print(f"   🐛 [debug] saved raw NDJSON → {debug_path}")
+            except OSError as exc:
+                print(f"   ⚠ Could not write debug NDJSON: {exc}")
+        if records:
+            first = records[0]
+            print(f"   🐛 [debug] first NDJSON record has {len(first)} fields")
+            print(f"   🐛 [debug] first record top-level keys: {sorted(first.keys())}")
+            # Highlight chat/agent specific fields so the user can spot mismatches.
+            relevant = {
+                k: v for k, v in first.items()
+                if "chat" in k.lower() or "agent" in k.lower() or "panel" in k.lower()
+            }
+            if relevant:
+                print(f"   🐛 [debug] chat/agent-related fields on first record: {relevant}")
+            else:
+                print("   🐛 [debug] no chat/agent/panel fields found on first record")
+
     return records, report_start, report_end
+
+
+def dedupe_ndjson_records(records: list[dict]) -> tuple[list[dict], int]:
+    """Dedupe NDJSON records by (user_login, day).
+
+    GitHub's user-level NDJSON returns each user's GLOBAL Copilot activity for
+    every org they hold a seat in — not org-scoped activity. So if a user is in
+    N orgs we will see N identical records per active day. Dedupe by
+    (user_login, day).
+
+    Defensive merge: in normal operation duplicates are byte-for-byte
+    identical, but to guard against any silent divergence we merge field-wise
+    — taking the MAX of numeric/count fields and the OR of boolean flags —
+    so we never lose volume data. Differences are logged.
+
+    Returns (merged_records, removed_count).
+    """
+    merged: dict[tuple[str, str], dict] = {}
+    diff_keys: set[str] = set()
+    diff_pairs = 0
+    for rec in records:
+        login = rec.get("user_login") or ""
+        day = rec.get("day") or ""
+        if not login or not day:
+            continue
+        key = (login, day)
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = dict(rec)
+            continue
+
+        pair_had_diff = False
+        for field, new_val in rec.items():
+            old_val = existing.get(field)
+            if isinstance(new_val, bool) or isinstance(old_val, bool):
+                combined = bool(new_val) or bool(old_val)
+                if combined != bool(old_val):
+                    existing[field] = combined
+                    pair_had_diff = True
+                    diff_keys.add(field)
+            elif isinstance(new_val, (int, float)) or isinstance(old_val, (int, float)):
+                try:
+                    new_num = float(new_val or 0)
+                    old_num = float(old_val or 0)
+                except (TypeError, ValueError):
+                    continue
+                if new_num > old_num:
+                    existing[field] = new_val
+                    pair_had_diff = True
+                    diff_keys.add(field)
+                elif new_num < old_num:
+                    pair_had_diff = True
+                    diff_keys.add(field)
+            elif old_val is None and new_val is not None:
+                existing[field] = new_val
+        if pair_had_diff:
+            diff_pairs += 1
+
+    removed = len(records) - len(merged)
+    if diff_pairs:
+        print(
+            f"   ⚠ Note: {diff_pairs} (user, day) pair(s) had differing values across orgs "
+            f"on fields: {sorted(diff_keys)}. Merged by field-wise max / boolean OR so no "
+            f"volume data was lost. (Normally records should be identical across orgs — this "
+            f"may indicate GitHub returned stale data for one org.)"
+        )
+    return list(merged.values()), removed
 
 
 def aggregate_user_ndjson(records: list[dict]) -> dict[str, dict[str, Any]]:
@@ -453,9 +617,23 @@ def classify_health(metrics: dict[str, Any]) -> tuple[str, str]:
 def build_user_rows(
     org: str,
     seats: list[dict],
-    ndjson_records: list[dict],
+    ndjson_records: list[dict] | None = None,
     report_end: str = "",
+    global_aggregation: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    """Build per-user rows for one org.
+
+    If `global_aggregation` is provided (a dict from user_login → aggregated
+    metrics produced by `aggregate_user_ndjson()` over the GLOBAL deduped
+    record pool), per-user numbers come from there. This is the correct path
+    because the user-level NDJSON returns global per-user activity for every
+    org the user holds a seat in — aggregating per-org would 4× overcount a
+    user who's in 4 orgs.
+
+    If `global_aggregation` is None, falls back to aggregating the supplied
+    org-scoped `ndjson_records` (legacy / single-org callers like the mock
+    generator).
+    """
     seat_map: dict[str, dict] = {}
     for seat in seats:
         assignee = seat.get("assignee", {}) or {}
@@ -464,8 +642,18 @@ def build_user_rows(
             seat_map[login] = seat
 
     baseline_date = _parse_iso_date(report_end) or datetime.utcnow().date()
-    ndjson_agg = aggregate_user_ndjson(ndjson_records)
-    all_logins = sorted(set(seat_map) | set(ndjson_agg))
+    if global_aggregation is not None:
+        ndjson_agg = global_aggregation
+        org_logins = {
+            rec.get("user_login")
+            for rec in (ndjson_records or [])
+            if rec.get("user_login")
+        }
+    else:
+        ndjson_agg = aggregate_user_ndjson(ndjson_records or [])
+        org_logins = set(ndjson_agg.keys())
+
+    all_logins = sorted(set(seat_map) | org_logins)
     rows: list[dict[str, Any]] = []
 
     for login in all_logins:
@@ -525,16 +713,21 @@ def build_user_rows(
 def dedupe_users_across_orgs(
     user_rows: list[dict[str, Any]],
     report_end: str = "",
+    metrics_are_global: bool = False,
 ) -> list[dict[str, Any]]:
     """Collapse per-org rows into one row per user_login.
 
-    organizations is a comma-separated, sorted list. Volumetric metrics are summed.
-    active_days uses the UNION of distinct active days across orgs (capped at 28)
-    so a user active on the same day in two orgs only counts once.
-    Rates (adoption, acceptance, contribution) are recomputed from the merged totals.
-    Seat dates use earliest assigned and latest activity; days_inactive is recomputed
-    against the shared baseline (report_end) for both singleton and multi-org users.
-    Health is reclassified on the merged numbers.
+    organizations is a comma-separated, sorted list. Seat dates use earliest
+    assigned and latest activity; days_inactive is recomputed against the
+    shared baseline (report_end). Health is reclassified on the merged numbers.
+
+    When ``metrics_are_global=True`` (the live `main()` path), each per-org row
+    already contains the user's GLOBAL Copilot metrics (because the user-level
+    NDJSON returns global activity for every org the user is a seat in). In
+    that case we take the first row's metrics directly — summing would multiply
+    by the number of orgs the user is in. Otherwise (mock / legacy / truly
+    org-scoped data) volume metrics are summed and `active_days` uses the
+    union of distinct days across orgs (capped at 28).
     """
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in user_rows:
@@ -561,16 +754,22 @@ def dedupe_users_across_orgs(
             "organizations": ", ".join(organizations),
             "user_login": login,
         }
-        for field in sum_fields:
-            merged[field] = sum(row.get(field, 0) for row in group)
 
-        # Union the daily-activity sets across orgs (cap at 28-day window length).
-        union_days: set[str] = set()
-        for row in group:
-            union_days |= set(row.get("_active_day_set") or ())
-        merged["active_days"] = min(len(union_days), REPORT_DAYS) if union_days else max(
-            (row.get("active_days", 0) for row in group), default=0
-        )
+        if metrics_are_global:
+            # Each per-org row already has the user's global metrics — take one.
+            base = group[0]
+            for field in sum_fields:
+                merged[field] = base.get(field, 0)
+            merged["active_days"] = base.get("active_days", 0)
+        else:
+            for field in sum_fields:
+                merged[field] = sum(row.get(field, 0) for row in group)
+            union_days: set[str] = set()
+            for row in group:
+                union_days |= set(row.get("_active_day_set") or ())
+            merged["active_days"] = min(len(union_days), REPORT_DAYS) if union_days else max(
+                (row.get("active_days", 0) for row in group), default=0
+            )
 
         merged["adoption_rate_pct"] = round(merged["active_days"] / REPORT_DAYS * 100, 1)
         merged["acceptance_rate_pct"] = _safe_pct(merged["code_acceptances"], merged["code_generations"])
@@ -621,13 +820,16 @@ def build_team_summary(
     unique_user_count = len(unique_rows)
     unique_active_user_count = sum(1 for row in unique_rows if row.get("active_days", 0) > 0)
 
-    total_code_generations = sum(row["code_generations"] for row in user_rows)
-    total_code_acceptances = sum(row["code_acceptances"] for row in user_rows)
-    total_loc_suggested = sum(row["loc_suggested"] for row in user_rows)
-    total_loc_added = sum(row["loc_added"] for row in user_rows)
-    total_loc_deleted = sum(row["loc_deleted"] for row in user_rows)
-    total_interactions = sum(row["total_interactions"] for row in user_rows)
-    total_estimated_time_saved = sum(row["estimated_time_saved_hrs"] for row in user_rows)
+    # IMPORTANT: totals are summed over unique users, not per-org rows. The user-level
+    # NDJSON returns each user's GLOBAL metrics for every org they hold a seat in, so
+    # summing per-org rows would multiply totals by the number of orgs per user.
+    total_code_generations = sum(row["code_generations"] for row in unique_rows)
+    total_code_acceptances = sum(row["code_acceptances"] for row in unique_rows)
+    total_loc_suggested = sum(row["loc_suggested"] for row in unique_rows)
+    total_loc_added = sum(row["loc_added"] for row in unique_rows)
+    total_loc_deleted = sum(row["loc_deleted"] for row in unique_rows)
+    total_interactions = sum(row["total_interactions"] for row in unique_rows)
+    total_estimated_time_saved = sum(row["estimated_time_saved_hrs"] for row in unique_rows)
     avg_time_saved_per_active_user = round(
         total_estimated_time_saved / unique_active_user_count, 1
     ) if unique_active_user_count else 0.0
@@ -948,6 +1150,15 @@ Examples:
     parser.add_argument("--enterprise", default=os.environ.get("ENTERPRISE_SLUG", ""))
     parser.add_argument("--orgs", default=os.environ.get("ORGS", ""))
     parser.add_argument("--output-dir", default=os.environ.get("OUTPUT_DIR", "."))
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help=(
+            "Save raw API payloads to ./debug_*.{ndjson,json} and print the first "
+            "record's field names per org. Useful for diagnosing field-name mismatches."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -965,6 +1176,9 @@ def main() -> None:
     print()
     validate_token(token)
     print()
+
+    if args.debug:
+        print("🐛 Debug mode ON — saving raw payloads to ./debug_*.{ndjson,json}\n")
 
     orgs_str = args.orgs or os.environ.get("ORGS", "")
     enterprise = args.enterprise or os.environ.get("ENTERPRISE_SLUG", "")
@@ -987,16 +1201,19 @@ def main() -> None:
 
     print(f"📊 Copilot Productivity Report — {REPORT_DAYS}-day window\n")
 
-    all_user_rows: list[dict[str, Any]] = []
+    org_payloads: list[dict[str, Any]] = []
+    seat_status: dict[str, str] = {}
     report_starts: list[str] = []
     report_ends: list[str] = []
+    all_records: list[dict] = []
 
     for org in orgs:
         print(f"🔍 {org}")
-        seats = fetch_seats(token, org)
-        print(f"   Seats: {len(seats)}")
+        seats, status = fetch_seats(token, org, debug=args.debug)
+        seat_status[org] = status
+        print(f"   Seats: {len(seats)} (status: {status})")
 
-        ndjson_records, report_start, report_end = fetch_ndjson(token, org)
+        ndjson_records, report_start, report_end = fetch_ndjson(token, org, debug=args.debug)
         print(f"   NDJSON records: {len(ndjson_records)}")
 
         if report_start:
@@ -1008,22 +1225,83 @@ def main() -> None:
             print("   ⚠ No data — skipping.")
             continue
 
-        user_rows = build_user_rows(org, seats, ndjson_records, report_end=report_end)
-        print(f"   📊 Users aggregated: {len(user_rows)}")
+        org_payloads.append({
+            "org": org,
+            "seats": seats,
+            "records": ndjson_records,
+            "report_end": report_end,
+        })
+        all_records.extend(ndjson_records)
+
+    if not org_payloads:
+        sys.exit("ERROR: No reportable user data found.")
+
+    # Global dedupe — the user-level NDJSON returns each user's global metrics
+    # for every org they hold a seat in. Without this, totals get multiplied by
+    # the number of orgs each user belongs to.
+    print(f"\n🔁 Deduping NDJSON across {len(org_payloads)} org(s) by (user_login, day) …")
+    deduped_records, removed = dedupe_ndjson_records(all_records)
+    if removed:
+        print(
+            f"   Collapsed {len(all_records)} records → {len(deduped_records)} "
+            f"({removed} duplicate (user, day) pair(s) removed)."
+        )
+    else:
+        print(f"   {len(all_records)} records, no cross-org duplicates found.")
+
+    global_aggregation = aggregate_user_ndjson(deduped_records)
+    print(f"   📊 Unique users with activity: {len(global_aggregation)}")
+
+    overall_report_end = max(report_ends) if report_ends else ""
+
+    all_user_rows: list[dict[str, Any]] = []
+    for payload in org_payloads:
+        user_rows = build_user_rows(
+            payload["org"],
+            payload["seats"],
+            payload["records"],
+            report_end=payload["report_end"] or overall_report_end,
+            global_aggregation=global_aggregation,
+        )
+        print(f"   📊 {payload['org']}: {len(user_rows)} row(s)")
         all_user_rows.extend(user_rows)
 
     if not all_user_rows:
         sys.exit("ERROR: No reportable user data found.")
 
     all_user_rows.sort(key=lambda row: (row["organization"], row["user_login"].lower()))
-    overall_report_end = max(report_ends) if report_ends else ""
-    unique_rows = dedupe_users_across_orgs(all_user_rows, report_end=overall_report_end)
+    unique_rows = dedupe_users_across_orgs(
+        all_user_rows,
+        report_end=overall_report_end,
+        metrics_are_global=True,
+    )
     summary = build_team_summary(
         all_user_rows,
         min(report_starts) if report_starts else "",
         overall_report_end,
         unique_rows=unique_rows,
     )
+
+    failed_orgs = [org for org, status in seat_status.items() if status != "ok"]
+    if failed_orgs:
+        print(
+            f"\n⚠ Seat data was unavailable for {len(failed_orgs)} org(s): "
+            f"{', '.join(failed_orgs)}.\n"
+            f"   → 'Seat Assigned Date' and 'Last Activity Date' will be blank for users in those orgs.\n"
+            f"   → Users who are licensed but INACTIVE will be MISSING from the report entirely\n"
+            f"     (only NDJSON-active users show up), so Team Adoption Rate and Needs Enablement\n"
+            f"     counts for those orgs are unreliable / likely overstated.\n"
+            f"   → Ensure your token has 'manage_billing:copilot' scope AND you are an admin of those orgs."
+        )
+
+    if len(set(report_starts)) > 1 or len(set(report_ends)) > 1:
+        print(
+            f"\n⚠ Report windows differ across orgs:\n"
+            f"   start days: {sorted(set(report_starts))}\n"
+            f"   end days:   {sorted(set(report_ends))}\n"
+            f"   → A user's global activity may span up to the widest window; the canonical\n"
+            f"     28-day window may be exceeded for some users."
+        )
 
     print("\n📊 Writing Excel report …")
     final_path = write_excel(output_path, all_user_rows, summary)

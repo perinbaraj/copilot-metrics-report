@@ -9,6 +9,10 @@ copilot_productivity_*.xlsx
 # Generated mock data
 mock_data/
 
+# Debug payloads (raw API responses from --debug flag; may contain user PII)
+debug_*.ndjson
+debug_*.json
+
 # Environment files with secrets
 .env
 .env.txt

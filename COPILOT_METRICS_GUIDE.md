@@ -551,7 +551,7 @@ One NDJSON row
 
 The productivity report uses shortened column names for readability. Here is the exact mapping between API fields and report columns:
 
-| Report Column | API Field (NDJSON) | Type |
+| Report Column | API Field / Source | Type / Description |
 |---|---|---|
 | `code_generations` | `code_generation_activity_count` | Sum across 28 days |
 | `code_acceptances` | `code_acceptance_activity_count` | Sum across 28 days |
@@ -559,6 +559,9 @@ The productivity report uses shortened column names for readability. Here is the
 | `loc_added` | `loc_added_sum` | Sum across 28 days |
 | `loc_deleted` | `loc_deleted_sum` | Sum across 28 days |
 | `active_days` | Count of distinct `day` records per user | Derived |
+| `seat_assigned_date` | `/orgs/{org}/copilot/billing/seats` → `seats[].created_at` | Seat assignment date (`YYYY-MM-DD`) |
+| `last_activity_date` | `/orgs/{org}/copilot/billing/seats` → `seats[].last_activity_at` | Last Copilot editor activity date; empty if never used |
+| `days_inactive` | Derived from `last_activity_at` and `report_end_day` | Days between last activity and the report end date; `"Never"` if `last_activity_at` is null |
 | `adoption_rate_pct` | `active_days / 28 × 100` | Derived (%) |
 | `acceptance_rate_pct` | `code_acceptances / code_generations × 100` | Derived (%) |
 | `copilot_contribution_pct` | `min(loc_suggested / loc_added, 1.0) × 100` | Derived (%, capped at 100) |
@@ -569,6 +572,20 @@ The productivity report uses shortened column names for readability. Here is the
 | `estimated_time_saved_hrs` | `code_acceptances × 5 / 60` | Derived (hours) |
 
 > **Why `_pct`?** Columns ending in `_pct` are calculated **percentages**, not raw API values. They help interpret the data without manual math.
+
+### Workbook sheet reference
+
+The generated Excel workbook contains four customer-facing worksheets. Use the sheet that matches the level of analysis needed:
+
+| Worksheet | What it contains | Best use | Key notes |
+|---|---|---|---|
+| **User Productivity** | One row per user per organization, including the new `seat_assigned_date`, `last_activity_date`, and `days_inactive` columns | Per-org analysis, org-specific follow-up, and validating how a user appears within each organization | A user who belongs to two organizations appears as two rows |
+| **Unique Users** | One row per distinct `user_login` across all organizations; `organization` is renamed to `organizations` and contains a comma-separated list when needed | Customer-wide adoption and ROI conversations where users should not be double-counted | Volumetric metrics are summed; `active_days` uses the max across orgs capped at 28; rates are recomputed from merged totals; `seat_assigned_date` is earliest, `last_activity_date` is latest; health profile is reclassified; sorted by `engagement_depth` descending |
+| **Needs Enablement** | Users from the deduped list where `health_profile == "Needs Enablement"`, including `user_login`, `organizations`, date/inactivity fields, activity counts, and `health_notes` | Coaching, training, and license-adoption follow-up | Sorted by `days_inactive` descending: users who have never used Copilot appear first, followed by the most stale users; if empty, the sheet shows `No users currently flagged for enablement` |
+| **Team Summary** | Rollup KPIs, health distribution, top engaged users, and enablement counts | Executive summary and customer readout | Overview includes `Unique Users` and `Unique Active Users`; health distribution uses the deduped unique-user list; top users by engagement depth shows the top 10 unique users and excludes zero-engagement users; enablement detail is shown in the **Needs Enablement** sheet |
+
+> [!NOTE]
+> In **Team Summary**, `Unique Users` means distinct `user_login`, and `Unique Active Users` means distinct `user_login` with `active_days > 0`. The previous inline enablement list is intentionally replaced by a count and a pointer to the **Needs Enablement** worksheet.
 
 ### Step 2 — Derive user-level KPIs
 

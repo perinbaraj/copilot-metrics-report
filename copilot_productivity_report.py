@@ -20,7 +20,7 @@ import os
 import sys
 import time
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +51,9 @@ MINUTES_SAVED_PER_ACCEPTANCE = 5  # conservative estimate per accepted suggestio
 USER_PRODUCTIVITY_COLUMNS = [
     "organization",
     "user_login",
+    "seat_assigned_date",
+    "last_activity_date",
+    "days_inactive",
     "active_days",
     "adoption_rate_pct",
     "total_interactions",
@@ -68,6 +71,24 @@ USER_PRODUCTIVITY_COLUMNS = [
     "engagement_depth",
     "estimated_time_saved_hrs",
     "health_profile",
+    "health_notes",
+]
+
+UNIQUE_USERS_COLUMNS = [
+    "organizations" if col == "organization" else col
+    for col in USER_PRODUCTIVITY_COLUMNS
+]
+
+ENABLEMENT_COLUMNS = [
+    "user_login",
+    "organizations",
+    "seat_assigned_date",
+    "last_activity_date",
+    "days_inactive",
+    "active_days",
+    "total_interactions",
+    "code_generations",
+    "code_acceptances",
     "health_notes",
 ]
 
@@ -150,6 +171,42 @@ def _safe_pct(numerator: float, denominator: float, cap: float | None = None) ->
     if cap is not None:
         pct = min(pct, cap)
     return pct
+
+
+def _parse_iso_date(value: Any) -> date | None:
+    """Parse an ISO 8601 date or datetime string; return the date portion."""
+    if not value:
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    text = str(value).strip()
+    if not text:
+        return None
+    candidate = text.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(candidate).date()
+    except ValueError:
+        pass
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _format_iso_date(value: date | None) -> str:
+    return value.isoformat() if value else ""
+
+
+def _compute_days_inactive(last_activity: date | None, baseline: date | None) -> Any:
+    """Days between baseline (report end) and last activity. 'Never' if no activity."""
+    if last_activity is None:
+        return "Never"
+    if baseline is None:
+        baseline = datetime.utcnow().date()
+    delta = (baseline - last_activity).days
+    return max(delta, 0)
 
 
 def validate_token(token: str) -> None:
@@ -348,6 +405,7 @@ def aggregate_user_ndjson(records: list[dict]) -> dict[str, dict[str, Any]]:
         aggregated[login] = {
             **metrics,
             "active_days": len(metrics["days_seen"]),
+            "active_day_set": frozenset(metrics["days_seen"]),
         }
         aggregated[login].pop("days_seen", None)
     return aggregated
@@ -392,7 +450,12 @@ def classify_health(metrics: dict[str, Any]) -> tuple[str, str]:
     return "Moderate", "Active but room to increase engagement"
 
 
-def build_user_rows(org: str, seats: list[dict], ndjson_records: list[dict]) -> list[dict[str, Any]]:
+def build_user_rows(
+    org: str,
+    seats: list[dict],
+    ndjson_records: list[dict],
+    report_end: str = "",
+) -> list[dict[str, Any]]:
     seat_map: dict[str, dict] = {}
     for seat in seats:
         assignee = seat.get("assignee", {}) or {}
@@ -400,6 +463,7 @@ def build_user_rows(org: str, seats: list[dict], ndjson_records: list[dict]) -> 
         if login:
             seat_map[login] = seat
 
+    baseline_date = _parse_iso_date(report_end) or datetime.utcnow().date()
     ndjson_agg = aggregate_user_ndjson(ndjson_records)
     all_logins = sorted(set(seat_map) | set(ndjson_agg))
     rows: list[dict[str, Any]] = []
@@ -417,9 +481,17 @@ def build_user_rows(org: str, seats: list[dict], ndjson_records: list[dict]) -> 
         agent_interactions = aggregated.get("agent_interactions", 0)
         engagement_depth = chat_interactions + agent_interactions
 
+        seat = seat_map.get(login, {})
+        assigned_date = _parse_iso_date(seat.get("created_at"))
+        last_activity_date = _parse_iso_date(seat.get("last_activity_at"))
+        days_inactive = _compute_days_inactive(last_activity_date, baseline_date)
+
         row: dict[str, Any] = {
             "organization": org,
             "user_login": login,
+            "seat_assigned_date": _format_iso_date(assigned_date),
+            "last_activity_date": _format_iso_date(last_activity_date),
+            "days_inactive": days_inactive,
             "active_days": active_days,
             "adoption_rate_pct": round(active_days / REPORT_DAYS * 100, 1),
             "total_interactions": total_interactions,
@@ -440,7 +512,8 @@ def build_user_rows(org: str, seats: list[dict], ndjson_records: list[dict]) -> 
             "used_agent": bool(aggregated.get("used_agent", False)),
             "used_cli": bool(aggregated.get("used_cli", False)),
             "used_code_review": bool(aggregated.get("used_code_review", False)),
-            "plan_type": (seat_map.get(login, {}).get("plan_type") or "") if login in seat_map else "",
+            "plan_type": (seat.get("plan_type") or "") if login in seat_map else "",
+            "_active_day_set": aggregated.get("active_day_set", frozenset()),
         }
         row["health_profile"], row["health_notes"] = classify_health(row)
         rows.append(row)
@@ -449,10 +522,104 @@ def build_user_rows(org: str, seats: list[dict], ndjson_records: list[dict]) -> 
     return rows
 
 
-def build_team_summary(user_rows: list[dict[str, Any]], report_start: str, report_end: str) -> dict[str, Any]:
+def dedupe_users_across_orgs(
+    user_rows: list[dict[str, Any]],
+    report_end: str = "",
+) -> list[dict[str, Any]]:
+    """Collapse per-org rows into one row per user_login.
+
+    organizations is a comma-separated, sorted list. Volumetric metrics are summed.
+    active_days uses the UNION of distinct active days across orgs (capped at 28)
+    so a user active on the same day in two orgs only counts once.
+    Rates (adoption, acceptance, contribution) are recomputed from the merged totals.
+    Seat dates use earliest assigned and latest activity; days_inactive is recomputed
+    against the shared baseline (report_end) for both singleton and multi-org users.
+    Health is reclassified on the merged numbers.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in user_rows:
+        grouped[row["user_login"]].append(row)
+
+    baseline_date = _parse_iso_date(report_end) or datetime.utcnow().date()
+    merged_rows: list[dict[str, Any]] = []
+
+    sum_fields = (
+        "total_interactions",
+        "code_generations",
+        "code_acceptances",
+        "loc_suggested",
+        "loc_added",
+        "loc_deleted",
+        "chat_interactions",
+        "agent_interactions",
+    )
+
+    for login, group in grouped.items():
+        organizations = sorted({row["organization"] for row in group if row.get("organization")})
+
+        merged: dict[str, Any] = {
+            "organizations": ", ".join(organizations),
+            "user_login": login,
+        }
+        for field in sum_fields:
+            merged[field] = sum(row.get(field, 0) for row in group)
+
+        # Union the daily-activity sets across orgs (cap at 28-day window length).
+        union_days: set[str] = set()
+        for row in group:
+            union_days |= set(row.get("_active_day_set") or ())
+        merged["active_days"] = min(len(union_days), REPORT_DAYS) if union_days else max(
+            (row.get("active_days", 0) for row in group), default=0
+        )
+
+        merged["adoption_rate_pct"] = round(merged["active_days"] / REPORT_DAYS * 100, 1)
+        merged["acceptance_rate_pct"] = _safe_pct(merged["code_acceptances"], merged["code_generations"])
+        merged["net_loc_change"] = merged["loc_added"] - merged["loc_deleted"]
+        merged["copilot_contribution_pct"] = _safe_pct(merged["loc_suggested"], merged["loc_added"], cap=100.0)
+        merged["engagement_depth"] = merged["chat_interactions"] + merged["agent_interactions"]
+        merged["estimated_time_saved_hrs"] = round(
+            merged["code_acceptances"] * MINUTES_SAVED_PER_ACCEPTANCE / 60, 1
+        )
+
+        merged["used_chat"] = any(row.get("used_chat") for row in group)
+        merged["used_agent"] = any(row.get("used_agent") for row in group)
+        merged["used_cli"] = any(row.get("used_cli") for row in group)
+        merged["used_code_review"] = any(row.get("used_code_review") for row in group)
+        merged["features_used"] = build_features_list(merged)
+
+        assigned_dates = [d for d in (_parse_iso_date(row.get("seat_assigned_date")) for row in group) if d]
+        activity_dates = [d for d in (_parse_iso_date(row.get("last_activity_date")) for row in group) if d]
+        merged["seat_assigned_date"] = _format_iso_date(min(assigned_dates)) if assigned_dates else ""
+        merged["last_activity_date"] = _format_iso_date(max(activity_dates)) if activity_dates else ""
+        merged["days_inactive"] = _compute_days_inactive(
+            max(activity_dates) if activity_dates else None, baseline_date
+        )
+
+        plan_types = sorted({row.get("plan_type") for row in group if row.get("plan_type")})
+        merged["plan_type"] = ", ".join(plan_types)
+
+        merged["health_profile"], merged["health_notes"] = classify_health(merged)
+        merged_rows.append(merged)
+
+    merged_rows.sort(key=lambda item: item["user_login"].lower())
+    return merged_rows
+
+
+def build_team_summary(
+    user_rows: list[dict[str, Any]],
+    report_start: str,
+    report_end: str,
+    unique_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    if unique_rows is None:
+        unique_rows = dedupe_users_across_orgs(user_rows, report_end=report_end)
+
     total_users = len(user_rows)
     active_users = [row for row in user_rows if row["active_days"] > 0]
     active_user_count = len(active_users)
+
+    unique_user_count = len(unique_rows)
+    unique_active_user_count = sum(1 for row in unique_rows if row.get("active_days", 0) > 0)
 
     total_code_generations = sum(row["code_generations"] for row in user_rows)
     total_code_acceptances = sum(row["code_acceptances"] for row in user_rows)
@@ -462,8 +629,8 @@ def build_team_summary(user_rows: list[dict[str, Any]], report_start: str, repor
     total_interactions = sum(row["total_interactions"] for row in user_rows)
     total_estimated_time_saved = sum(row["estimated_time_saved_hrs"] for row in user_rows)
     avg_time_saved_per_active_user = round(
-        total_estimated_time_saved / active_user_count, 1
-    ) if active_user_count else 0.0
+        total_estimated_time_saved / unique_active_user_count, 1
+    ) if unique_active_user_count else 0.0
 
     health_order = [
         "Power User",
@@ -474,25 +641,32 @@ def build_team_summary(user_rows: list[dict[str, Any]], report_start: str, repor
         "Low Usage",
         "Needs Enablement",
     ]
-    distribution = Counter(row["health_profile"] for row in user_rows)
+    distribution = Counter(row["health_profile"] for row in unique_rows)
 
     top_users = sorted(
-        user_rows,
-        key=lambda row: (row["engagement_depth"], row["active_days"], row["total_interactions"], row["user_login"].lower()),
+        (row for row in unique_rows if row.get("engagement_depth", 0) > 0),
+        key=lambda row: (
+            row["engagement_depth"],
+            row["active_days"],
+            row["total_interactions"],
+            row["user_login"].lower(),
+        ),
         reverse=True,
-    )[:5]
-    enablement_users = [row["user_login"] for row in user_rows if row["health_profile"] == "Needs Enablement"]
+    )[:10]
+    enablement_rows = [row for row in unique_rows if row.get("health_profile") == "Needs Enablement"]
 
     def feature_pct(flag: str) -> float:
-        if not active_user_count:
+        if not unique_active_user_count:
             return 0.0
-        count = sum(1 for row in active_users if row.get(flag))
-        return round(count / active_user_count * 100, 1)
+        count = sum(1 for row in unique_rows if row.get("active_days", 0) > 0 and row.get(flag))
+        return round(count / unique_active_user_count * 100, 1)
 
     return {
         "total_users": total_users,
         "active_users": active_user_count,
-        "team_adoption_rate_pct": _safe_pct(active_user_count, total_users),
+        "unique_user_count": unique_user_count,
+        "unique_active_user_count": unique_active_user_count,
+        "team_adoption_rate_pct": _safe_pct(unique_active_user_count, unique_user_count),
         "report_period": f"{report_start} → {report_end}" if report_start and report_end else "N/A",
         "total_code_generations": total_code_generations,
         "total_code_acceptances": total_code_acceptances,
@@ -505,11 +679,11 @@ def build_team_summary(user_rows: list[dict[str, Any]], report_start: str, repor
         "avg_time_saved_per_active_user_hrs": avg_time_saved_per_active_user,
         "total_interactions": total_interactions,
         "avg_engagement_depth_per_user": round(
-            sum(row["engagement_depth"] for row in user_rows) / total_users, 1
-        ) if total_users else 0.0,
+            sum(row["engagement_depth"] for row in unique_rows) / unique_user_count, 1
+        ) if unique_user_count else 0.0,
         "avg_active_days_per_user": round(
-            sum(row["active_days"] for row in user_rows) / total_users, 1
-        ) if total_users else 0.0,
+            sum(row["active_days"] for row in unique_rows) / unique_user_count, 1
+        ) if unique_user_count else 0.0,
         "feature_adoption": {
             "Chat": feature_pct("used_chat"),
             "Agent": feature_pct("used_agent"),
@@ -518,7 +692,9 @@ def build_team_summary(user_rows: list[dict[str, Any]], report_start: str, repor
         },
         "health_distribution": {label: distribution.get(label, 0) for label in health_order},
         "top_users": top_users,
-        "enablement_users": enablement_users,
+        "enablement_users": [row["user_login"] for row in enablement_rows],
+        "enablement_rows": enablement_rows,
+        "unique_rows": unique_rows,
     }
 
 
@@ -540,25 +716,22 @@ def _autosize_columns(ws) -> None:
         ws.column_dimensions[column_letter].width = min(max(max_length + 2, 12), 30)
 
 
-def write_excel(output_path: Path, user_rows: list[dict[str, Any]], summary: dict[str, Any]) -> Path:
-    workbook = Workbook()
-    user_ws = workbook.active
-    user_ws.title = "User Productivity"
+def _write_user_sheet(
+    workbook: Workbook,
+    sheet_title: str,
+    columns: list[str],
+    rows: list[dict[str, Any]],
+) -> None:
+    """Write a User Productivity-style sheet (per-org or unique-user variant)."""
+    ws = workbook.create_sheet(sheet_title)
+    ws.append(columns)
+    for row in rows:
+        ws.append([row.get(column, "") for column in columns])
 
-    user_ws.append(USER_PRODUCTIVITY_COLUMNS)
-    for row in user_rows:
-        user_ws.append([row.get(column, "") for column in USER_PRODUCTIVITY_COLUMNS])
+    _style_header_row(ws)
 
-    _style_header_row(user_ws)
-
-    percentage_columns = {
-        "adoption_rate_pct",
-        "acceptance_rate_pct",
-        "copilot_contribution_pct",
-    }
-    decimal_columns = {
-        "estimated_time_saved_hrs",
-    }
+    percentage_columns = {"adoption_rate_pct", "acceptance_rate_pct", "copilot_contribution_pct"}
+    decimal_columns = {"estimated_time_saved_hrs"}
     number_columns = {
         "active_days",
         "total_interactions",
@@ -572,29 +745,117 @@ def write_excel(output_path: Path, user_rows: list[dict[str, Any]], summary: dic
         "agent_interactions",
         "engagement_depth",
     }
-    header_index = {name: idx + 1 for idx, name in enumerate(USER_PRODUCTIVITY_COLUMNS)}
-    health_col = header_index["health_profile"]
+    date_columns = {"seat_assigned_date", "last_activity_date"}
+    days_inactive_column = "days_inactive"
 
-    for row_idx in range(2, user_ws.max_row + 1):
+    header_index = {name: idx + 1 for idx, name in enumerate(columns)}
+    health_col = header_index.get("health_profile")
+
+    for row_idx in range(2, ws.max_row + 1):
         for column_name in percentage_columns:
-            user_ws.cell(row=row_idx, column=header_index[column_name]).number_format = "0.0"
+            if column_name in header_index:
+                ws.cell(row=row_idx, column=header_index[column_name]).number_format = "0.0"
         for column_name in decimal_columns:
-            user_ws.cell(row=row_idx, column=header_index[column_name]).number_format = "0.0"
+            if column_name in header_index:
+                ws.cell(row=row_idx, column=header_index[column_name]).number_format = "0.0"
         for column_name in number_columns:
-            user_ws.cell(row=row_idx, column=header_index[column_name]).number_format = "#,##0"
+            if column_name in header_index:
+                ws.cell(row=row_idx, column=header_index[column_name]).number_format = "#,##0"
+        for column_name in date_columns:
+            if column_name in header_index:
+                ws.cell(row=row_idx, column=header_index[column_name]).number_format = "yyyy-mm-dd"
+        if days_inactive_column in header_index:
+            cell = ws.cell(row=row_idx, column=header_index[days_inactive_column])
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = "#,##0"
 
-        health_cell = user_ws.cell(row=row_idx, column=health_col)
-        style = HEALTH_STYLES.get(str(health_cell.value), HEALTH_STYLES["Moderate"])
-        health_cell.fill = style["fill"]
-        health_cell.font = style["font"]
+        if health_col:
+            health_cell = ws.cell(row=row_idx, column=health_col)
+            style = HEALTH_STYLES.get(str(health_cell.value), HEALTH_STYLES["Moderate"])
+            health_cell.fill = style["fill"]
+            health_cell.font = style["font"]
 
-    _autosize_columns(user_ws)
+    _autosize_columns(ws)
+
+
+def _enablement_sort_key(row: dict[str, Any]) -> tuple[int, int, str]:
+    """Sort key for Needs Enablement: 'Never' first, then largest days_inactive."""
+    days = row.get("days_inactive")
+    if isinstance(days, str):  # 'Never'
+        return (0, 0, row["user_login"].lower())
+    return (1, -int(days or 0), row["user_login"].lower())
+
+
+def _write_enablement_sheet(
+    workbook: Workbook,
+    enablement_rows: list[dict[str, Any]],
+) -> None:
+    ws = workbook.create_sheet("Needs Enablement")
+    ws.append(ENABLEMENT_COLUMNS)
+
+    if not enablement_rows:
+        ws.append(["No users currently flagged for enablement"] + [""] * (len(ENABLEMENT_COLUMNS) - 1))
+        _style_header_row(ws)
+        _autosize_columns(ws)
+        return
+
+    sorted_rows = sorted(enablement_rows, key=_enablement_sort_key)
+    for row in sorted_rows:
+        ws.append([row.get(column, "") for column in ENABLEMENT_COLUMNS])
+
+    _style_header_row(ws)
+
+    header_index = {name: idx + 1 for idx, name in enumerate(ENABLEMENT_COLUMNS)}
+    number_columns = {"active_days", "total_interactions", "code_generations", "code_acceptances"}
+    date_columns = {"seat_assigned_date", "last_activity_date"}
+
+    enablement_fill = HEALTH_STYLES["Needs Enablement"]["fill"]
+    enablement_font = HEALTH_STYLES["Needs Enablement"]["font"]
+    login_col = header_index["user_login"]
+
+    for row_idx in range(2, ws.max_row + 1):
+        for column_name in number_columns:
+            if column_name in header_index:
+                ws.cell(row=row_idx, column=header_index[column_name]).number_format = "#,##0"
+        for column_name in date_columns:
+            if column_name in header_index:
+                ws.cell(row=row_idx, column=header_index[column_name]).number_format = "yyyy-mm-dd"
+        days_cell = ws.cell(row=row_idx, column=header_index["days_inactive"])
+        if isinstance(days_cell.value, (int, float)):
+            days_cell.number_format = "#,##0"
+
+        login_cell = ws.cell(row=row_idx, column=login_col)
+        login_cell.fill = enablement_fill
+        login_cell.font = enablement_font
+
+    _autosize_columns(ws)
+
+
+def write_excel(output_path: Path, user_rows: list[dict[str, Any]], summary: dict[str, Any]) -> Path:
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+
+    _write_user_sheet(workbook, "User Productivity", USER_PRODUCTIVITY_COLUMNS, user_rows)
+
+    unique_rows = summary["unique_rows"]
+    unique_rows_sorted = sorted(
+        unique_rows,
+        key=lambda row: (
+            -int(row.get("engagement_depth", 0) or 0),
+            -int(row.get("active_days", 0) or 0),
+            row["user_login"].lower(),
+        ),
+    )
+    _write_user_sheet(workbook, "Unique Users", UNIQUE_USERS_COLUMNS, unique_rows_sorted)
+
+    _write_enablement_sheet(workbook, summary["enablement_rows"])
 
     summary_ws = workbook.create_sheet("Team Summary")
     summary_rows: list[tuple[str, Any, str]] = [
         ("Overview", "", "section"),
-        ("Total Users", summary["total_users"], "label"),
-        ("Active Users", summary["active_users"], "label"),
+        ("Total User-Org Rows", summary["total_users"], "number"),
+        ("Unique Users", summary["unique_user_count"], "number"),
+        ("Unique Active Users", summary["unique_active_user_count"], "number"),
         ("Team Adoption Rate", summary["team_adoption_rate_pct"], "pct"),
         ("Report Period", summary["report_period"], "label"),
         ("", "", "blank"),
@@ -623,7 +884,7 @@ def write_excel(output_path: Path, user_rows: list[dict[str, Any]], summary: dic
         ("CLI", summary["feature_adoption"]["CLI"], "pct"),
         ("Code Review", summary["feature_adoption"]["Code Review"], "pct"),
         ("", "", "blank"),
-        ("Health Distribution", "", "section"),
+        ("Health Distribution (unique users)", "", "section"),
     ]
 
     for label, count in summary["health_distribution"].items():
@@ -631,7 +892,7 @@ def write_excel(output_path: Path, user_rows: list[dict[str, Any]], summary: dic
 
     summary_rows.extend([
         ("", "", "blank"),
-        ("Top 5 Users by Engagement Depth", "", "section"),
+        ("Top 10 Users by Engagement Depth", "", "section"),
     ])
     if summary["top_users"]:
         for row in summary["top_users"]:
@@ -642,11 +903,8 @@ def write_excel(output_path: Path, user_rows: list[dict[str, Any]], summary: dic
     summary_rows.extend([
         ("", "", "blank"),
         ("Users Needing Enablement", "", "section"),
-        (
-            "Users",
-            ", ".join(summary["enablement_users"]) if summary["enablement_users"] else "None",
-            "label",
-        ),
+        ("Count", len(summary["enablement_users"]), "number"),
+        ("Details", "See 'Needs Enablement' sheet", "label"),
     ])
 
     current_row = 1
@@ -750,7 +1008,7 @@ def main() -> None:
             print("   ⚠ No data — skipping.")
             continue
 
-        user_rows = build_user_rows(org, seats, ndjson_records)
+        user_rows = build_user_rows(org, seats, ndjson_records, report_end=report_end)
         print(f"   📊 Users aggregated: {len(user_rows)}")
         all_user_rows.extend(user_rows)
 
@@ -758,10 +1016,13 @@ def main() -> None:
         sys.exit("ERROR: No reportable user data found.")
 
     all_user_rows.sort(key=lambda row: (row["organization"], row["user_login"].lower()))
+    overall_report_end = max(report_ends) if report_ends else ""
+    unique_rows = dedupe_users_across_orgs(all_user_rows, report_end=overall_report_end)
     summary = build_team_summary(
         all_user_rows,
         min(report_starts) if report_starts else "",
-        max(report_ends) if report_ends else "",
+        overall_report_end,
+        unique_rows=unique_rows,
     )
 
     print("\n📊 Writing Excel report …")

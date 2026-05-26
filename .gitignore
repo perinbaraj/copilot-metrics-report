@@ -6,6 +6,11 @@ copilot_raw_*.json
 copilot_report_*.csv
 copilot_productivity_*.xlsx
 
+# Excel lock files (created automatically when a workbook is open)
+~$*.xlsx
+~$*.xlsm
+~$*.xls
+
 # Generated mock data
 mock_data/
 

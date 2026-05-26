@@ -559,7 +559,12 @@ That ordering prevents advanced agent users from being incorrectly labeled as we
 **A:** Nothing on the API side. `status: ok` means the seats endpoint returned **HTTP 200 with an empty list**, not an error. Three things can produce this:
 
 1. **The activity is from users on Copilot Pro / Individual (personal subscription).** They show up in NDJSON because they're org members using personal Copilot, but the org has no org-assigned seats. `Seat Assigned Date` will be **correctly blank** for these users — there's no seat to read a `created_at` from. This is the most common cause when you're testing on your own personal-account orgs.
-2. **The org is under enterprise-level seat management (Copilot Enterprise).** Org-level `/orgs/{org}/copilot/billing/seats` returns empty because the seats are assigned at the enterprise level. **Fix:** re-run with `--enterprise <real-enterprise-slug>`. The script now automatically falls back to `/enterprises/{enterprise}/copilot/billing/seats` and buckets the seats back per org. The `<slug>` is your enterprise account name (e.g. `acme-corp`), **not** your GitHub username.
+2. **The org is under enterprise-level seat management (Copilot Enterprise).** Org-level `/orgs/{org}/copilot/billing/seats` returns empty because the seats are assigned at the enterprise level. **Fix:** re-run with `--enterprise <real-enterprise-slug>`. The script now automatically:
+   - Pre-fetches `/enterprises/{enterprise}/copilot/billing/seats`.
+   - **Discovers enterprise-owned orgs from the seats response** (`seat.organization.login`) and adds them to the iteration list, even when `/enterprises/{enterprise}/organizations` is forbidden (the two endpoints have different access requirements).
+   - **Builds a global seat map** (`login.lower()` → seat) so a user holding an enterprise-level seat granted by org A shows that seat's dates and plan_type in **every** org B row their activity appears in. This is the "Copilot Enterprise spillover" case — the user is a member of multiple orgs but the licensing seat lives in one.
+   - Per-org seats still **win** over the global map when both exist (more specific source).
+   - The `<slug>` is your enterprise account name (e.g. `acme-corp`), **not** your GitHub username.
 3. **The org has Copilot Business but no users assigned yet.** Visit `https://github.com/organizations/<org>/settings/copilot/seat_management` to confirm.
 
 The script now prints a loud `⚠ N org(s) still have 0 seats but show Copilot activity` block at the end of each run when this happens, with the same diagnosis.

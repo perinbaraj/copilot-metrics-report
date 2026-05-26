@@ -719,6 +719,7 @@ def build_user_rows(
     ndjson_records: list[dict] | None = None,
     report_end: str = "",
     global_aggregation: dict[str, dict[str, Any]] | None = None,
+    global_seat_map: dict[str, dict] | None = None,
     debug: bool = False,
 ) -> list[dict[str, Any]]:
     """Build per-user rows for one org.
@@ -733,6 +734,14 @@ def build_user_rows(
     If `global_aggregation` is None, falls back to aggregating the supplied
     org-scoped `ndjson_records` (legacy / single-org callers like the mock
     generator).
+
+    `global_seat_map` (login.lower() → seat dict) is consulted as a fallback
+    for users that don't have a per-org seat — typically because the user
+    holds a seat granted by a DIFFERENT org under the same enterprise
+    (Copilot Enterprise spillover), or because the user is licensed via
+    Copilot Pro showing up in another org's activity. This ensures
+    `seat_assigned_date`, `last_activity_date`, and `plan_type` populate
+    for every licensed user across every org row they appear in.
     """
     # Case-insensitive seat lookup: NDJSON typically returns lowercase logins,
     # but the seats endpoint preserves the original GitHub casing. Without case
@@ -821,6 +830,19 @@ def build_user_rows(
         engagement_depth = total_interactions
 
         seat = seat_map.get(key, {})
+        seat_source = "per_org" if seat else None
+        # Fallback: a licensed user may not have an org-assigned seat in this
+        # specific org (e.g. their seat was granted by another org under the
+        # same enterprise, or they're on Copilot Pro). Pull seat data from
+        # the global seat map keyed by `login.lower()`. This is what makes
+        # `seat_assigned_date` populate for users whose enterprise license
+        # was granted by an org we didn't iterate as the "current" org.
+        if not seat and global_seat_map:
+            ent_seat = global_seat_map.get(key)
+            if ent_seat:
+                seat = ent_seat
+                seat_source = "enterprise"
+
         assigned_date = _parse_iso_date(seat.get("created_at"))
         last_activity_date = _parse_iso_date(seat.get("last_activity_at"))
 
@@ -868,7 +890,7 @@ def build_user_rows(
             "used_agent": bool(aggregated.get("used_agent", False)),
             "used_cli": bool(aggregated.get("used_cli", False)),
             "used_code_review": bool(aggregated.get("used_code_review", False)),
-            "plan_type": (seat.get("plan_type") or "") if key in seat_map else "",
+            "plan_type": (seat.get("plan_type") or "") if seat else "",
             "_active_day_set": aggregated.get("active_day_set", frozenset()),
         }
         row["health_profile"], row["health_notes"] = classify_health(row)
@@ -1369,6 +1391,44 @@ def main() -> None:
 
     print(f"📊 Copilot Productivity Report — {REPORT_DAYS}-day window\n")
 
+    # Pre-fetch enterprise seats (if --enterprise provided). The seats response
+    # carries a `seat.organization.login` per seat, which lets us:
+    #   (1) Discover enterprise-owned orgs even when /enterprises/{ent}/organizations
+    #       is forbidden — different endpoints have different access requirements.
+    #   (2) Build a GLOBAL seat map so a user holding an enterprise-level seat
+    #       granted by org A shows that seat in any org B's row (Copilot
+    #       Enterprise spillover — the user's activity appears in B's NDJSON
+    #       because they're a member, but the licensing seat lives in A).
+    ent_seats_by_org: dict[str, list[dict]] = {}
+    ent_status = ""
+    if enterprise:
+        print(f"🏢 Pre-fetching enterprise-level seats for: {enterprise}")
+        ent_seats_by_org, ent_status = fetch_enterprise_seats(
+            token, enterprise, debug=args.debug
+        )
+        if ent_seats_by_org:
+            total_ent_seats = sum(len(v) for v in ent_seats_by_org.values())
+            ent_org_names = sorted(
+                k for k in ent_seats_by_org if k != "__enterprise_team__"
+            )
+            print(
+                f"   ✅ Enterprise endpoint returned {total_ent_seats} seat(s) "
+                f"across {len(ent_org_names)} org(s): {ent_org_names}"
+            )
+            # Discovery: add any enterprise-owned orgs we don't already know about.
+            existing_lower = {o.lower() for o in orgs}
+            for ent_org in ent_org_names:
+                if ent_org.lower() not in existing_lower:
+                    orgs.append(ent_org)
+                    existing_lower.add(ent_org.lower())
+                    print(f"   ➕ Added enterprise-owned org to iteration: {ent_org}")
+        else:
+            print(
+                f"   ⚠ Enterprise seats endpoint returned no data (status: {ent_status}). "
+                f"Falling back to per-org seats only."
+            )
+        print()
+
     org_payloads: list[dict[str, Any]] = []
     seat_status: dict[str, str] = {}
     report_starts: list[str] = []
@@ -1376,9 +1436,24 @@ def main() -> None:
     all_records: list[dict] = []
     empty_seat_orgs_with_activity: list[str] = []
 
+    # Build a case-folded lookup for enterprise seats by org name so we can
+    # merge them into the per-org payload regardless of casing differences.
+    ent_seats_by_org_lower = {k.lower(): v for k, v in ent_seats_by_org.items()}
+
     for org in orgs:
         print(f"🔍 {org}")
         seats, status = fetch_seats(token, org, debug=args.debug)
+        # Merge in any enterprise-level seats GitHub recorded for this org.
+        # Use case-insensitive matching because the enterprise endpoint may
+        # return org names with different casing than what was iterated.
+        ent_for_org = ent_seats_by_org_lower.get(org.lower(), [])
+        if ent_for_org and not seats:
+            seats = ent_for_org
+            status = "ok_enterprise"
+            print(
+                f"   🔁 Backfilled {len(seats)} seat(s) from enterprise endpoint "
+                f"for {org}."
+            )
         seat_status[org] = status
         print(f"   Seats: {len(seats)} (status: {status})")
 
@@ -1408,41 +1483,30 @@ def main() -> None:
     if not org_payloads:
         sys.exit("ERROR: No reportable user data found.")
 
-    # Enterprise-level seats fallback. Per-org /orgs/{org}/copilot/billing/seats
-    # returns HTTP 200 with seats:[] when the org's Copilot subscription is
-    # managed centrally at the enterprise level (Copilot Enterprise). The
-    # authoritative source in that case is
-    # /enterprises/{enterprise}/copilot/billing/seats, which carries an
-    # `organization` field per seat so we can bucket them back per org.
-    if empty_seat_orgs_with_activity and enterprise:
+    # Build the GLOBAL seat map (login.lower() → seat) across every seat we
+    # collected (per-org + enterprise + enterprise-team-only seats). This is
+    # the fallback consulted by build_user_rows for users that appear in an
+    # org's NDJSON but don't have a seat granted by THAT org — typically
+    # because their seat was granted by another org under the same enterprise
+    # or by an enterprise team.
+    global_seat_map: dict[str, dict] = {}
+    for payload in org_payloads:
+        for seat in payload["seats"]:
+            login = ((seat.get("assignee") or {}).get("login") or "").lower()
+            if login:
+                global_seat_map[login] = seat
+    # Also include enterprise-team-only seats (no `organization` field) that
+    # wouldn't otherwise be reachable from any per-org payload.
+    for seat in ent_seats_by_org.get("__enterprise_team__", []):
+        login = ((seat.get("assignee") or {}).get("login") or "").lower()
+        if login and login not in global_seat_map:
+            global_seat_map[login] = seat
+    if global_seat_map:
         print(
-            f"\n🏢 {len(empty_seat_orgs_with_activity)} org(s) had 0 seats but show NDJSON activity. "
-            f"Trying enterprise-level seats endpoint as a fallback …"
+            f"\n🗂  Global seat map built: {len(global_seat_map)} licensed user(s) "
+            f"across all sources. Will be used as a fallback for users whose "
+            f"per-org seat lookup misses (Copilot Enterprise spillover)."
         )
-        ent_seats_by_org, ent_status = fetch_enterprise_seats(
-            token, enterprise, debug=args.debug
-        )
-        if ent_seats_by_org:
-            total_ent_seats = sum(len(v) for v in ent_seats_by_org.values())
-            print(
-                f"   ✅ Enterprise endpoint returned {total_ent_seats} seat(s) "
-                f"across {len(ent_seats_by_org)} org(s). Merging into per-org data."
-            )
-            for payload in org_payloads:
-                org_name = payload["org"]
-                if not payload["seats"] and org_name in ent_seats_by_org:
-                    payload["seats"] = ent_seats_by_org[org_name]
-                    seat_status[org_name] = "ok_enterprise"
-                    print(
-                        f"   🔁 {org_name}: backfilled "
-                        f"{len(payload['seats'])} seat(s) from enterprise endpoint."
-                    )
-        else:
-            print(
-                f"   ⚠ Enterprise endpoint returned no seats either "
-                f"(status: {ent_status}). The orgs likely have no Copilot "
-                f"Business/Enterprise subscription — see message below."
-            )
 
     # Re-compute which orgs still have 0 seats + activity after the fallback.
     still_empty = [
@@ -1456,20 +1520,26 @@ def main() -> None:
         )
         for org in still_empty:
             print(f"     • {org}")
-        print(
-            "\n   What this means:\n"
-            "   • The seats API is NOT failing — it's returning HTTP 200 with an empty list.\n"
-            "   • Your PAT scopes/permissions are NOT the issue.\n"
-            "   • Likely cause: the activity is from users on a personal Copilot Pro / Individual\n"
-            "     subscription (not org-assigned seats), so there's no org-level seat record to read\n"
-            "     a `created_at` from. `Seat Assigned Date` will be blank for these users —\n"
-            "     that's accurate, not a bug.\n"
-            "   • If the org IS supposed to have Copilot Business/Enterprise:\n"
-            "       1) Pass --enterprise <slug> (NOT your username) to use the enterprise endpoint.\n"
-            "       2) Confirm the org actually has assigned seats at\n"
-            "          https://github.com/organizations/<org>/settings/copilot/seat_management.\n"
-            "   • `Last Activity Date` is still backfilled from NDJSON, so the report remains useful.\n"
-        )
+        if global_seat_map:
+            print(
+                "\n   These users' seat data will be sourced from the global seat map "
+                "(other orgs / enterprise endpoint) where available.\n"
+            )
+        else:
+            print(
+                "\n   What this means:\n"
+                "   • The seats API is NOT failing — it's returning HTTP 200 with an empty list.\n"
+                "   • Your PAT scopes/permissions are NOT the issue.\n"
+                "   • Likely cause: the activity is from users on a personal Copilot Pro / Individual\n"
+                "     subscription (not org-assigned seats), so there's no org-level seat record to read\n"
+                "     a `created_at` from. `Seat Assigned Date` will be blank for these users —\n"
+                "     that's accurate, not a bug.\n"
+                "   • If the org IS supposed to have Copilot Business/Enterprise:\n"
+                "       1) Pass --enterprise <slug> (NOT your username) to use the enterprise endpoint.\n"
+                "       2) Confirm the org actually has assigned seats at\n"
+                "          https://github.com/organizations/<org>/settings/copilot/seat_management.\n"
+                "   • `Last Activity Date` is still backfilled from NDJSON, so the report remains useful.\n"
+            )
 
     # Global dedupe — the user-level NDJSON returns each user's global metrics
     # for every org they hold a seat in. Without this, totals get multiplied by
@@ -1497,6 +1567,7 @@ def main() -> None:
             payload["records"],
             report_end=payload["report_end"] or overall_report_end,
             global_aggregation=global_aggregation,
+            global_seat_map=global_seat_map,
             debug=args.debug,
         )
         if args.debug:

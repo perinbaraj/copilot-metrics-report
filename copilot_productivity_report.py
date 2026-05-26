@@ -54,6 +54,7 @@ USER_PRODUCTIVITY_COLUMNS = [
     "seat_assigned_date",
     "last_activity_date",
     "days_inactive",
+    "inactive_days_in_window",
     "active_days",
     "adoption_rate_pct",
     "total_interactions",
@@ -85,6 +86,7 @@ ENABLEMENT_COLUMNS = [
     "seat_assigned_date",
     "last_activity_date",
     "days_inactive",
+    "inactive_days_in_window",
     "active_days",
     "total_interactions",
     "code_generations",
@@ -879,6 +881,7 @@ def build_user_rows(
             "seat_assigned_date": _format_iso_date(assigned_date),
             "last_activity_date": _format_iso_date(last_activity_date),
             "days_inactive": days_inactive,
+            "inactive_days_in_window": max(REPORT_DAYS - active_days, 0),
             "active_days": active_days,
             "adoption_rate_pct": round(active_days / REPORT_DAYS * 100, 1),
             "total_interactions": total_interactions,
@@ -971,6 +974,7 @@ def dedupe_users_across_orgs(
             )
 
         merged["adoption_rate_pct"] = round(merged["active_days"] / REPORT_DAYS * 100, 1)
+        merged["inactive_days_in_window"] = max(REPORT_DAYS - merged["active_days"], 0)
         merged["acceptance_rate_pct"] = _safe_pct(merged["code_acceptances"], merged["code_generations"])
         merged["net_loc_change"] = merged["loc_added"] - merged["loc_deleted"]
         merged["copilot_contribution_pct"] = _safe_pct(merged["loc_suggested"], merged["loc_added"], cap=100.0)

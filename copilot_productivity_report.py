@@ -1370,6 +1370,13 @@ def write_excel(output_path: Path, user_rows: list[dict[str, Any]], summary: dic
 
     _write_enablement_sheet(workbook, summary["enablement_rows"])
 
+    # Per-org live-license counts for the Team Summary breakdown. Uses the same
+    # `_has_org_seat` predicate as the Licensed Users by Org sheet, so the
+    # sum of per-org counts here equals `total_live_licenses` exactly.
+    licenses_per_org = Counter(
+        row["organization"] for row in user_rows if row.get("_has_org_seat")
+    )
+
     summary_ws = workbook.create_sheet("Team Summary")
     summary_rows: list[tuple[str, Any, str]] = [
         ("Overview", "", "section"),
@@ -1379,6 +1386,15 @@ def write_excel(output_path: Path, user_rows: list[dict[str, Any]], summary: dic
         ("Total Live Licensed Users", total_live_licenses, "number"),
         ("Team Adoption Rate", summary["team_adoption_rate_pct"], "pct"),
         ("Report Period", summary["report_period"], "label"),
+        ("", "", "blank"),
+        ("Licenses per Organization (live seats)", "", "section"),
+    ]
+    if licenses_per_org:
+        for org_name in sorted(licenses_per_org.keys()):
+            summary_rows.append((org_name, licenses_per_org[org_name], "number"))
+    else:
+        summary_rows.append(("No live licenses found", "", "label"))
+    summary_rows.extend([
         ("", "", "blank"),
         ("Code Acceleration", "", "section"),
         ("Total Code Generations", summary["total_code_generations"], "number"),
@@ -1406,7 +1422,7 @@ def write_excel(output_path: Path, user_rows: list[dict[str, Any]], summary: dic
         ("Code Review", summary["feature_adoption"]["Code Review"], "pct"),
         ("", "", "blank"),
         ("Health Distribution (unique users)", "", "section"),
-    ]
+    ])
 
     for label, count in summary["health_distribution"].items():
         summary_rows.append((label, count, "number"))

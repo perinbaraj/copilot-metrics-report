@@ -772,9 +772,25 @@ def classify_health(metrics: dict[str, Any]) -> tuple[str, str]:
         return "Low Usage", "Minimal usage — may need guidance on workflow integration"
     if acceptance_rate >= 30 and active_days >= 14 and engagement_depth >= 50:
         return "Power User", "Heavy, effective usage across features"
-    if agent_interactions > chat_interactions and loc_added > loc_suggested * 2 and loc_added > 0:
+    # Agent-Heavy: agent dominates the user's prompts (either by interaction
+    # volume OR via the legacy LOC signature where agent edits balloon
+    # loc_added past loc_suggested × 2). The interaction-count path is the
+    # one that actually fires for real GitHub data, because agent edits
+    # typically don't populate `loc_added_sum` reliably.
+    if agent_interactions > chat_interactions and (
+        agent_interactions >= 10
+        or (loc_added > loc_suggested * 2 and loc_added > 0)
+    ):
         return "Agent-Heavy", "Primary usage through agent/edit mode — advanced adoption pattern"
-    if chat_interactions > 0 and code_generations <= 5:
+    # Chat-Focused: chat dominates over both agent and code completions —
+    # i.e. the user is using Copilot for Q&A / debugging, not generation.
+    # Requiring `chat > agent` prevents agent-dominant users with a small
+    # amount of chat activity from being mislabeled here.
+    if (
+        chat_interactions > agent_interactions
+        and chat_interactions >= 5
+        and code_generations <= 5
+    ):
         return "Chat-Focused", "Uses Copilot for Q&A and understanding rather than code generation"
     if acceptance_rate >= 25 and active_days >= 7:
         return "Healthy", "Good adoption with consistent usage"

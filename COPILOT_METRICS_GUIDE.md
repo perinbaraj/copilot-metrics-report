@@ -505,8 +505,8 @@ The productivity report in this repository uses a **rule-based classification** 
 |---|---|---|---|
 | **Power User** | 🟢 Green | `acceptance ≥ 30%`, `active_days ≥ 14`, `engagement_depth ≥ 50` | Celebrate and harvest best practices |
 | **Healthy** | 🟢 Green | `acceptance ≥ 25%`, `active_days ≥ 7` | Maintain momentum |
-| **Agent-Heavy** | 🟡 Yellow | `agent_interactions > chat_interactions` and `loc_added > loc_suggested × 2` | Valid advanced pattern; study it |
-| **Chat-Focused** | 🟡 Yellow | Chat activity present, but `code_generations ≤ 5` | Encourage completions / edit workflows |
+| **Agent-Heavy** | 🟡 Yellow | `agent_interactions > chat_interactions` **and** (`agent_interactions ≥ 10` *or* `loc_added > loc_suggested × 2` with `loc_added > 0`) | Valid advanced pattern; study it |
+| **Chat-Focused** | 🟡 Yellow | `chat_interactions > agent_interactions` and `chat_interactions ≥ 5` and `code_generations ≤ 5` | Encourage completions / edit workflows |
 | **Moderate** | 🔵 Blue | Active, but below healthy thresholds | Targeted enablement on weak areas |
 | **Low Usage** | 🔴 Red | `1–3 active days` and `< 20 interactions` | Workflow-integration coaching needed |
 | **Needs Enablement** | 🔴 Red | `0 active days` or minimal meaningful usage | Training recommended |

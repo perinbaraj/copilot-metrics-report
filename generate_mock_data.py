@@ -185,6 +185,49 @@ def split_chat_modes(rng: random.Random, total_chat: int) -> tuple[int, int, int
     return ask, edit, plan
 
 
+def build_totals_by_feature(
+    *,
+    ask_mode: int = 0,
+    edit_mode: int = 0,
+    plan_mode: int = 0,
+    custom_mode: int = 0,
+    agent_mode: int = 0,
+    chat_inline: int = 0,
+    agent_edit_codegen: int = 0,
+) -> list[dict]:
+    """Build a real-schema `totals_by_feature` array from per-feature counts.
+
+    The real GitHub Copilot Metrics API nests per-feature interaction counts
+    inside this array (one entry per feature surface). We emit only entries
+    with non-zero activity so the shape matches what GitHub actually returns.
+    """
+    out: list[dict] = []
+
+    def add(feature: str, uic: int, codegen: int = 0, accept: int = 0) -> None:
+        if uic <= 0 and codegen <= 0 and accept <= 0:
+            return
+        out.append(
+            {
+                "feature": feature,
+                "user_initiated_interaction_count": uic,
+                "code_generation_activity_count": codegen,
+                "code_acceptance_activity_count": accept,
+            }
+        )
+
+    add("chat_panel_ask_mode", ask_mode)
+    add("chat_panel_edit_mode", edit_mode)
+    add("chat_panel_plan_mode", plan_mode)
+    add("chat_panel_custom_mode", custom_mode)
+    add("chat_panel_agent_mode", agent_mode)
+    add("chat_inline", chat_inline)
+    # agent_edit has user_initiated_interaction_count=0 in real data — it shows
+    # up only through code_generation_activity_count when the agent edits files.
+    if agent_edit_codegen > 0:
+        add("agent_edit", 0, codegen=agent_edit_codegen)
+    return out
+
+
 def choose_active_days(rng: random.Random, active_days: int) -> list[str]:
     if active_days <= 0:
         return []
@@ -257,12 +300,13 @@ def build_daily_record(
         loc_added = min(rng.randint(0, 3), loc_suggested)
         loc_deleted = rng.randint(*profile.loc_deleted_per_day)
         ask_mode, edit_mode, plan_mode = split_chat_modes(rng, chat_total)
+        inline_chat = rng.randint(0, 2)
         acceptance_rate = rand_rate(rng, profile.acceptance_pct)
         return {
             "user_login": login,
             "user_id": user_id,
             "day": day,
-            "user_initiated_interaction_count": max(interactions, chat_total),
+            "user_initiated_interaction_count": max(interactions, chat_total + inline_chat),
             "code_generation_activity_count": code_generations,
             "code_acceptance_activity_count": round(code_generations * acceptance_rate),
             "loc_suggested_to_add_sum": loc_suggested,
@@ -274,6 +318,12 @@ def build_daily_record(
             "chat_panel_agent_mode": 0,
             "chat_panel_custom_mode": 0,
             "chat_panel_unknown_mode": 0,
+            "totals_by_feature": build_totals_by_feature(
+                ask_mode=ask_mode,
+                edit_mode=edit_mode,
+                plan_mode=plan_mode,
+                chat_inline=inline_chat,
+            ),
             "used_chat": True,
             "used_agent": False,
             "used_cli": False,
@@ -296,12 +346,14 @@ def build_daily_record(
     used_chat = "chat" in profile.features and chat_total > 0
     used_agent = "agent" in profile.features and agent_total > 0
     used_cli = "cli" in profile.features and rng.random() < 0.45
+    inline_chat = rng.randint(0, 2) if used_chat else 0
+    agent_edit_codegen = rng.randint(1, 4) if used_agent and rng.random() < 0.5 else 0
 
     return {
         "user_login": login,
         "user_id": user_id,
         "day": day,
-        "user_initiated_interaction_count": max(interactions, chat_total + agent_total),
+        "user_initiated_interaction_count": max(interactions, chat_total + agent_total + inline_chat),
         "code_generation_activity_count": code_generations,
         "code_acceptance_activity_count": round(code_generations * acceptance_rate),
         "loc_suggested_to_add_sum": loc_suggested,
@@ -313,6 +365,14 @@ def build_daily_record(
         "chat_panel_agent_mode": agent_total,
         "chat_panel_custom_mode": 0,
         "chat_panel_unknown_mode": 0,
+        "totals_by_feature": build_totals_by_feature(
+            ask_mode=ask_mode,
+            edit_mode=edit_mode,
+            plan_mode=plan_mode,
+            agent_mode=agent_total,
+            chat_inline=inline_chat,
+            agent_edit_codegen=agent_edit_codegen,
+        ),
         "used_chat": used_chat,
         "used_agent": used_agent,
         "used_cli": used_cli,

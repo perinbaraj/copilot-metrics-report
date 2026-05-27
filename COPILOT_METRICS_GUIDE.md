@@ -162,15 +162,21 @@ Each downloaded file is newline-delimited JSON:
 
 ### 3.2 Interaction Metrics
 
+> **Schema note:** in the real GitHub Copilot Metrics user-level NDJSON, per-mode chat counts are **not** top-level fields. They're nested inside a `totals_by_feature` array — one entry per feature surface the user touched that day. Each entry carries its own `user_initiated_interaction_count`, `code_generation_activity_count`, and `code_acceptance_activity_count`. Feature names we've observed in real data include `chat_panel_ask_mode`, `chat_panel_edit_mode`, `chat_panel_plan_mode`, `chat_panel_agent_mode`, `chat_panel_custom_mode`, `chat_panel_unknown_mode`, `chat_inline`, and `agent_edit` (with more surfaces such as `chat_terminal`, `chat_github_dot_com` likely appearing as GitHub releases them).
+
 | Field | Type | Description | Important Notes |
 |---|---|---|---|
-| `user_initiated_interaction_count` | integer | Number of explicit prompts sent to Copilot | Does **not** include opening chat, switching modes, shortcuts, or configuration changes |
-| `chat_panel_ask_mode` | integer | Interactions sent while Ask mode was selected | Subset of `user_initiated_interaction_count` |
-| `chat_panel_edit_mode` | integer | Interactions sent while Edit mode was selected | Often associated with file changes |
+| `user_initiated_interaction_count` | integer | Number of explicit prompts sent to Copilot | Does **not** include opening chat, switching modes, shortcuts, or configuration changes. Top-level value equals the sum of `user_initiated_interaction_count` across all `totals_by_feature` entries for the day. |
+| `totals_by_feature[].feature` | string | Feature/surface the entry describes | e.g. `chat_panel_ask_mode`, `chat_panel_agent_mode`, `chat_inline`, `agent_edit` |
+| `totals_by_feature[].user_initiated_interaction_count` | integer | Interactions sent while that feature/surface was in use | Use these per-feature counts to derive chat-mode breakdowns |
+| `chat_panel_ask_mode` | integer | Interactions sent while Ask mode was selected | Read from `totals_by_feature[].user_initiated_interaction_count` where `feature == "chat_panel_ask_mode"` |
+| `chat_panel_edit_mode` | integer | Interactions sent while Edit mode was selected | Same nesting; often associated with file changes |
 | `chat_panel_plan_mode` | integer | Interactions sent while Plan mode was selected | Reflects planning / reasoning workflows |
 | `chat_panel_agent_mode` | integer | Interactions sent while Agent mode was selected | Includes autonomous multi-step workflows |
 | `chat_panel_custom_mode` | integer | Interactions sent to a custom agent | Useful for custom enterprise agents |
 | `chat_panel_unknown_mode` | integer | Interactions where mode attribution was unknown | Usually small |
+| `chat_inline` | integer | Inline chat interactions in the editor | Lives only inside `totals_by_feature` |
+| `agent_edit` | integer | Autonomous agent edits | `user_initiated_interaction_count` is typically 0; the meaningful signal is `code_generation_activity_count` |
 
 ### 3.3 Code Generation Metrics
 
@@ -292,7 +298,7 @@ Each downloaded file is newline-delimited JSON:
 | Total Active Users | Count of unique users in the 28-day window | Derived |
 | Code Completion Acceptance Rate | `code_acceptance_activity_count / code_generation_activity_count` | Derived |
 | Agent Adoption % | `% of active users with used_agent = true` | Derived |
-| Requests per Chat Mode | `chat_panel_*_mode` fields | Direct |
+| Requests per Chat Mode | `totals_by_feature[].user_initiated_interaction_count`, grouped by `feature` (`chat_panel_ask_mode`, `chat_panel_edit_mode`, `chat_panel_plan_mode`, `chat_panel_agent_mode`, `chat_panel_custom_mode`, `chat_inline`, etc.) | Direct (nested) |
 | Lines of Code Changed with AI | `loc_added_sum + loc_deleted_sum` | Derived |
 | Agent Contribution % | `agent_edit LOC / total LOC changed` | Derived |
 | Feature Breadth | Count of distinct flags / modes used (`used_chat`, `used_agent`, `used_cli`, code review) | Derived |
@@ -428,7 +434,7 @@ This means:
 ### 5.4 Dimension 3: Workflow Impact
 
 **Key metrics**
-- `chat_panel_ask_mode`, `chat_panel_edit_mode`, `chat_panel_plan_mode`, `chat_panel_agent_mode`
+- `totals_by_feature[].user_initiated_interaction_count` grouped by feature — surfaces like `chat_panel_ask_mode`, `chat_panel_edit_mode`, `chat_panel_plan_mode`, `chat_panel_agent_mode`, `chat_inline`
 - `used_chat`, `used_agent`, `used_cli`
 
 | KPI | Formula | What It Means |
@@ -549,11 +555,14 @@ That ordering prevents advanced agent users from being incorrectly labeled as we
 ### Q: `engagement_depth` shows 0 even though `features_used` says `chat, agent`.
 **A:** This was a known issue and is now fixed.
 
-**Why it happened:** the old formula was `engagement_depth = chat_interactions + agent_interactions`, where those columns sum **only** the `chat_panel_*_mode` counters. Those counters only fire when chat is used via the **IDE chat panel**. If the user uses chat through any other surface — inline chat in the editor, terminal chat, GitHub.com chat, agent edits in edit-mode — the boolean flags `used_chat` / `used_agent` are set but the panel-mode counters stay at zero, so `engagement_depth` was `0`.
+**Why it happened:** the old formula was `engagement_depth = chat_interactions + agent_interactions`. Earlier versions of the script also tried to read `chat_panel_*_mode` as **top-level** NDJSON fields — but GitHub nests those counts inside a `totals_by_feature` array, so the reads always returned 0. The result was `engagement_depth = 0` for everyone, even users whose `used_chat` / `used_agent` booleans were `true`.
 
-**The fix:** `engagement_depth` is now sourced from `user_initiated_interaction_count` (= the `total_interactions` column). The docs define this as *"Number of explicit prompts sent to Copilot"* and it explicitly excludes opening chat, switching modes, shortcuts, and passive completions — making it the right cross-surface engagement signal.
+**The fix:** two changes work together now.
 
-**What still uses the panel-only counters:** the `chat_interactions` and `agent_interactions` columns are kept as breakdown columns (useful when populated) and the `Chat-Focused` / `Agent-Heavy` health profiles still use them. For users where panel-mode is always 0 you'll see those classifications less often even though Power User / Healthy / Moderate continue to work correctly.
+1. `chat_interactions` / `agent_interactions` are derived correctly by iterating `totals_by_feature[]` and classifying each entry's `user_initiated_interaction_count` by feature name (see §3.2 and §8). They now reflect real chat / agent activity across every surface GitHub reports — panel modes, inline chat, and any agent feature.
+2. `engagement_depth` is sourced from `user_initiated_interaction_count` (= the `total_interactions` column). The docs define this as *"Number of explicit prompts sent to Copilot"* and it explicitly excludes opening chat, switching modes, shortcuts, and passive completions — making it the right cross-surface engagement signal.
+
+**What this means for the breakdown columns:** the `chat_interactions` and `agent_interactions` columns are now reliable enough to drive the `Chat-Focused` / `Agent-Heavy` health profiles directly. If you ever see `used_chat: true` paired with `chat_interactions = 0`, it's a sign GitHub introduced a new feature surface that the classifier doesn't yet recognize — capture a `--debug` NDJSON sample and the classifier rule can be extended.
 
 ### Q: `days_inactive` shows `0` for an active user even though their seat's `last_activity_at` was today. Is that wrong?
 **A:** No. `days_inactive` in this report is **NOT** "calendar days since last use" — that field was misleading, because `seat.last_activity_at` is a real-time signal that updates the moment a user opens an IDE with the Copilot extension loaded (passive presence counts). That made the column always show `0` for anyone with an IDE open, regardless of whether they actually prompted Copilot.
@@ -613,11 +622,19 @@ When this happens the toolkit prints a `⚠ WARNING: seats fetch returned HTTP .
 **Caveat:** Users who are licensed but **inactive** (no NDJSON activity) will be missing from the report entirely when seats are unavailable — so Team Adoption Rate and Needs Enablement counts for those orgs are unreliable. Re-run with a token that has the right scope and admin role to fix this.
 
 ### Q: `chat_interactions` / `agent_interactions` show 0 even though `used_chat: true` / `used_agent: true`.
-**A:** Possible causes:
+**A:** This was a real bug in versions of the toolkit before the `totals_by_feature` fix and is now resolved.
 
-1. **Field-name mismatch** — GitHub occasionally renames or restructures NDJSON fields. Run with `--debug` and inspect the printed `first record top-level keys` to confirm the field names match what the script expects (`chat_panel_ask_mode`, `chat_panel_edit_mode`, `chat_panel_plan_mode`, `chat_panel_custom_mode`, `chat_panel_agent_mode`).
-2. **Chat used only via surfaces that don't populate panel-mode counters** — for example, inline chat suggestions in some IDEs may set `used_chat: true` without incrementing the panel-mode counts.
-3. **Window has no chat days** — `used_chat: true` is sticky across the window; the counter may still be zero on the specific days returned.
+**Root cause:** GitHub returns per-mode chat/agent counts **nested inside a `totals_by_feature` array**, not as top-level `chat_panel_*_mode` fields. Earlier versions of the script read `rec.get("chat_panel_ask_mode")` directly off the top-level object, which always returned `None` (→ 0) for real-world data — while `used_chat` / `used_agent` are genuine top-level booleans and stayed correct. That's why Feature Adoption %s looked right while the count columns flatlined at 0.
+
+**Current behaviour:** `aggregate_user_ndjson` iterates `rec["totals_by_feature"]` and classifies each entry's `user_initiated_interaction_count` via `_classify_feature(name)`:
+
+- If the feature name contains `"agent"` (e.g. `chat_panel_agent_mode`, `agent_edit`, future `agent_*` surfaces) → **agent_interactions**.
+- Else if it starts with `chat_` (e.g. `chat_panel_ask_mode`, `chat_panel_edit_mode`, `chat_panel_plan_mode`, `chat_panel_custom_mode`, `chat_panel_unknown_mode`, `chat_inline`, future `chat_terminal`, `chat_github_dot_com`) → **chat_interactions**.
+- Anything else (e.g. `others`, completion-related surfaces) → skipped from the chat/agent counts.
+
+A fallback to the legacy top-level `chat_panel_*_mode` reads is still in place, so old fixtures and mock data without the array continue to work.
+
+**If you still see 0:** run with `--debug` and inspect the saved `debug_<org>_*.ndjson`. Look at the `totals_by_feature` array on a record where `used_chat: true`. If you see a feature name that's neither `agent`-bearing nor `chat_`-prefixed (a brand new surface GitHub just shipped), report it so the classifier can be extended.
 
 ### Q: How do I capture the raw API payloads for debugging?
 **A:** Run the report with `--debug`:
@@ -666,8 +683,8 @@ The productivity report uses shortened column names for readability. Here is the
 | `acceptance_rate_pct` | `code_acceptances / code_generations × 100` | Derived (%) |
 | `copilot_contribution_pct` | `min(loc_suggested / loc_added, 1.0) × 100` | Derived (%, capped at 100) |
 | `net_loc_change` | `loc_added − loc_deleted` | Derived |
-| `chat_interactions` | Sum of `chat_panel_ask_mode` + `edit_mode` + `plan_mode` + `custom_mode` | Derived (excludes agent mode) |
-| `agent_interactions` | `chat_panel_agent_mode` | Sum across 28 days |
+| `chat_interactions` | Σ `user_initiated_interaction_count` from `totals_by_feature[]` entries where the feature name starts with `chat_` (e.g. `chat_panel_ask_mode`, `chat_panel_edit_mode`, `chat_panel_plan_mode`, `chat_panel_custom_mode`, `chat_panel_unknown_mode`, `chat_inline`) — **excluding** `chat_panel_agent_mode`, which is counted as agent | Derived (sum across the 28-day window) |
+| `agent_interactions` | Σ `user_initiated_interaction_count` from `totals_by_feature[]` entries whose feature name contains `agent` (e.g. `chat_panel_agent_mode`, `agent_edit`) | Derived (sum across the 28-day window) |
 | `engagement_depth` | `Σ user_initiated_interaction_count` (= `total_interactions`); covers active prompts across all Copilot surfaces, not just the chat panel | Derived |
 | `estimated_time_saved_hrs` | `code_acceptances × 5 / 60` | Derived (hours) |
 

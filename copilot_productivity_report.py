@@ -624,6 +624,35 @@ def dedupe_ndjson_records(records: list[dict]) -> tuple[list[dict], int]:
     return list(merged.values()), removed
 
 
+def _classify_feature(name: str) -> str:
+    """Classify a `totals_by_feature[].feature` name as 'chat', 'agent', or 'other'.
+
+    GitHub's user-level Copilot Metrics NDJSON nests per-feature interaction counts
+    inside a `totals_by_feature` array (one entry per feature surface the user
+    touched that day). We bucket those entries into the customer-facing
+    `chat_interactions` / `agent_interactions` columns using a prefix rule:
+
+      - `agent` wins if `"agent"` appears anywhere in the name (e.g.
+        `chat_panel_agent_mode`, `agent_edit`, future `agent_*` surfaces).
+      - Otherwise it's `chat` if the name starts with `chat_` (e.g.
+        `chat_panel_ask_mode`, `chat_panel_edit_mode`, `chat_panel_plan_mode`,
+        `chat_panel_custom_mode`, `chat_inline`, future `chat_terminal`, etc.).
+      - Everything else (`others`, completion-related surfaces, …) → `other`
+        and is intentionally excluded from chat/agent counts.
+
+    Putting the agent check first matters because `chat_panel_agent_mode` is
+    semantically agent activity even though its name starts with `chat_`.
+    """
+    if not name:
+        return "other"
+    lowered = name.lower()
+    if "agent" in lowered:
+        return "agent"
+    if lowered.startswith("chat_"):
+        return "chat"
+    return "other"
+
+
 def aggregate_user_ndjson(records: list[dict]) -> dict[str, dict[str, Any]]:
     """Aggregate daily NDJSON records per user_login."""
     users: dict[str, dict[str, Any]] = defaultdict(
@@ -660,13 +689,38 @@ def aggregate_user_ndjson(records: list[dict]) -> dict[str, dict[str, Any]]:
         user["loc_suggested"] += _safe_int(rec.get("loc_suggested_to_add_sum"))
         user["loc_added"] += _safe_int(rec.get("loc_added_sum"))
         user["loc_deleted"] += _safe_int(rec.get("loc_deleted_sum"))
-        user["chat_interactions"] += (
-            _safe_int(rec.get("chat_panel_ask_mode"))
-            + _safe_int(rec.get("chat_panel_edit_mode"))
-            + _safe_int(rec.get("chat_panel_plan_mode"))
-            + _safe_int(rec.get("chat_panel_custom_mode"))
-        )
-        user["agent_interactions"] += _safe_int(rec.get("chat_panel_agent_mode"))
+
+        # Chat / agent interaction counts.
+        # The real GitHub Copilot Metrics API nests these inside `totals_by_feature`,
+        # one entry per feature surface (chat_panel_ask_mode, chat_panel_agent_mode,
+        # chat_inline, agent_edit, etc.). We bucket each entry's user_initiated
+        # interaction count via _classify_feature.
+        #
+        # If `totals_by_feature` is missing or empty (older fixtures / mock data),
+        # we fall back to reading the legacy flat `chat_panel_*_mode` keys so we
+        # don't silently drop pre-existing test data.
+        features_arr = rec.get("totals_by_feature") or []
+        if features_arr:
+            for entry in features_arr:
+                if not isinstance(entry, dict):
+                    continue
+                bucket = _classify_feature(entry.get("feature", ""))
+                if bucket == "chat":
+                    user["chat_interactions"] += _safe_int(
+                        entry.get("user_initiated_interaction_count")
+                    )
+                elif bucket == "agent":
+                    user["agent_interactions"] += _safe_int(
+                        entry.get("user_initiated_interaction_count")
+                    )
+        else:
+            user["chat_interactions"] += (
+                _safe_int(rec.get("chat_panel_ask_mode"))
+                + _safe_int(rec.get("chat_panel_edit_mode"))
+                + _safe_int(rec.get("chat_panel_plan_mode"))
+                + _safe_int(rec.get("chat_panel_custom_mode"))
+            )
+            user["agent_interactions"] += _safe_int(rec.get("chat_panel_agent_mode"))
 
         if rec.get("used_chat"):
             user["used_chat"] = True
